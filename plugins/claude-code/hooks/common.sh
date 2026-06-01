@@ -22,7 +22,7 @@ else
 fi
 
 # Ensure common user bin paths are in PATH (hooks may run in a minimal env)
-for p in "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "/usr/local/bin"; do
+for p in "/opt/venvs/memsearch/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "/usr/local/bin"; do
   [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
