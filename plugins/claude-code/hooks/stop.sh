@@ -1,8 +1,33 @@
 #!/usr/bin/env bash
-# Stop hook: parse transcript, summarize with claude -p, and save to memory.
+# Stop hook (forge fork): parse the last transcript turn, append its raw content
+# to the daily memory file, and drop a spool entry. Summarization AND indexing
+# are handled out-of-band by the memsearch-summarize PM2 service (port 8494) —
+# this hook stays minimal to avoid hangs and per-turn cost in the async hook env.
+#
+# Forge divergence from upstream stop.sh (re-authored on top of v0.4.14, was
+# forge commit 293fe23 on the stale v0.4.5 base):
+#   - No inline `claude -p` summarization. Upstream's summarizer hardening
+#     (--tools "", --safe-mode, SUMMARIZE_MODEL, MEMSEARCH_DISABLE) is not
+#     applicable here because this hook never spawns claude; the PM2 service
+#     calls the Anthropic API directly in a controlled, traced environment.
+#   - No inline `run_memsearch index` — the PM2 service indexes each spool
+#     entry after it summarizes it.
+#   - Writes a spool JSON the PM2 service consumes.
+# The stdin-hang and recursion-guard fixes now live in common.sh upstream
+# (timeout-guarded INPUT read + MEMSEARCH_DISABLE early-exit), so this hook
+# inherits them.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
+
+# Close stdin — async hooks may leave the pipe open, blocking child processes.
+# (common.sh already timeout-guards its own INPUT read; this protects the
+# parse-transcript.sh / python children spawned below.)
+exec < /dev/null
+
+# common.sh sets -euo pipefail; this hook tolerates non-zero exits and handles
+# failures with explicit fallbacks.
+set +euo pipefail
 
 # Prevent infinite loop: if this Stop was triggered by a previous Stop hook, bail out
 STOP_HOOK_ACTIVE=$(_json_val "$INPUT" "stop_hook_active" "false")
@@ -11,38 +36,18 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
 
-# Skip summarization when the required API key is missing — embedding/search
-# would fail, and the session likely only contains the "key not set" warning.
-_required_env_var() {
-  case "$1" in
-    openai) echo "OPENAI_API_KEY" ;;
-    google) echo "GOOGLE_API_KEY" ;;
-    voyage) echo "VOYAGE_API_KEY" ;;
-    jina) echo "JINA_API_KEY" ;;
-    mistral) echo "MISTRAL_API_KEY" ;;
-    *) echo "" ;;  # onnx, ollama, local — no API key needed
-  esac
-}
-_PROVIDER=$($MEMSEARCH_CMD config get embedding.provider 2>/dev/null || echo "onnx")
-_REQ_KEY=$(_required_env_var "$_PROVIDER")
-if [ -n "$_REQ_KEY" ] && [ -z "${!_REQ_KEY:-}" ]; then
-  # Env var not set — check if API key is configured in memsearch config file
-  _CONFIG_API_KEY=""
-  if [ -n "$MEMSEARCH_CMD" ]; then
-    _CONFIG_API_KEY=$($MEMSEARCH_CMD config get embedding.api_key 2>/dev/null || echo "")
-  fi
-  if [ -z "$_CONFIG_API_KEY" ]; then
-    echo '{}'
-    exit 0
-  fi
-fi
-
-# Extract transcript path from hook input
+# Extract transcript path and session id from hook input
 TRANSCRIPT_PATH=$(_json_val "$INPUT" "transcript_path" "")
+SESSION_ID=$(_json_val "$INPUT" "session_id" "")
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   echo '{}'
   exit 0
+fi
+
+# Fall back to the transcript filename when the hook input omits session_id
+if [ -z "$SESSION_ID" ]; then
+  SESSION_ID=$(basename "$TRANSCRIPT_PATH" .jsonl)
 fi
 
 # Check if transcript is empty (< 3 lines = no real content)
@@ -53,12 +58,6 @@ if [ "$LINE_COUNT" -lt 3 ]; then
 fi
 
 ensure_memory_dir
-
-SUMMARIZE_ENABLED=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.enabled 2>/dev/null || echo "true")
-if [ "$SUMMARIZE_ENABLED" = "false" ]; then
-  echo '{}'
-  exit 0
-fi
 
 # Parse transcript — extract the last turn only (one user question + all responses)
 PARSED=$("$SCRIPT_DIR/parse-transcript.sh" "$TRANSCRIPT_PATH" 2>/dev/null || true)
@@ -73,8 +72,8 @@ TODAY=$(date +%Y-%m-%d)
 NOW=$(date +%H:%M)
 MEMORY_FILE="$MEMORY_DIR/$TODAY.md"
 
-# Extract session ID and last user turn UUID for progressive disclosure anchors
-SESSION_ID=$(basename "$TRANSCRIPT_PATH" .jsonl)
+# Extract last user turn UUID for progressive disclosure anchors.
+# List-content-aware and UTF-8 tolerant (adopted from upstream v0.4.14).
 LAST_USER_TURN_UUID=$(python3 -c "
 import json, sys
 uuid = ''
@@ -97,84 +96,33 @@ with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
 print(uuid)
 " "$TRANSCRIPT_PATH" 2>/dev/null || true)
 
-# Load summarization prompt: user custom (via config) > plugin built-in template
-AGENT_NAME="Claude Code"
-PROMPT_FILE=""
-if [ -n "$MEMSEARCH_CMD" ]; then
-  PROMPT_FILE=$($MEMSEARCH_CMD config get prompts.summarize 2>/dev/null || true)
-fi
-if [ -n "$PROMPT_FILE" ] && [ -f "$PROMPT_FILE" ]; then
-  SYSTEM_PROMPT=$(sed "s/{{AGENT_NAME}}/$AGENT_NAME/g" "$PROMPT_FILE")
-elif [ -f "${CLAUDE_PLUGIN_ROOT}/prompts/summarize.txt" ]; then
-  SYSTEM_PROMPT=$(sed "s/{{AGENT_NAME}}/$AGENT_NAME/g" "${CLAUDE_PLUGIN_ROOT}/prompts/summarize.txt")
-else
-  SYSTEM_PROMPT="You are a third-person note-taker. Summarize the transcript as 2-10 bullet points. Write in third person. Mandatory language rule: write every bullet in the same primary language as the [User] text. If User mixes languages, use the dominant user-facing language. Do NOT answer User's question. Output ONLY bullet points."
-fi
-
-# Summarize the last turn into structured bullet points.
-# Default: use claude -p with the plugin default model. A plugin-specific
-# summarize model override can replace the model without changing provider
-# routing.
-SUMMARY=""
-SUMMARIZE_PROVIDER=""
-if [ -n "$MEMSEARCH_CMD" ]; then
-  SUMMARIZE_PROVIDER=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.provider 2>/dev/null || true)
-fi
-
-if [ -n "$SUMMARIZE_PROVIDER" ] && [ "$SUMMARIZE_PROVIDER" != "native" ] && [ -n "$MEMSEARCH_CMD" ]; then
-  SUMMARY=$(printf '%s' "$PARSED" | MEMSEARCH_NO_WATCH=1 $MEMSEARCH_CMD summarize \
-    --plugin claude-code \
-    --agent-name "$AGENT_NAME" \
-    2>/dev/null || true)
-elif command -v claude &>/dev/null; then
-  SUMMARIZE_MODEL="haiku"
-  if [ -n "$MEMSEARCH_CMD" ]; then
-    CONFIG_MODEL=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.model 2>/dev/null || true)
-    if [ -n "$CONFIG_MODEL" ]; then
-      SUMMARIZE_MODEL="$CONFIG_MODEL"
-    fi
-  fi
-  # Keep the shared external-observer prompt, but pass it as the primary prompt.
-  # This avoids the stdin + --system-prompt path while preserving summary rules.
-  LLM_PROMPT="${SYSTEM_PROMPT}
-
-Transcript:
-${PARSED}"
-  CLAUDE_SAFE_MODE_ARG=""
-  if claude --help 2>/dev/null | grep -q -- '--safe-mode'; then
-    CLAUDE_SAFE_MODE_ARG="--safe-mode"
-  fi
-  SUMMARY=$(MEMSEARCH_NO_WATCH=1 MEMSEARCH_DISABLE=1 CLAUDECODE= claude -p \
-    ${CLAUDE_SAFE_MODE_ARG:+"$CLAUDE_SAFE_MODE_ARG"} \
-    --strict-mcp-config \
-    --tools "" \
-    --model "$SUMMARIZE_MODEL" \
-    --no-session-persistence \
-    --no-chrome \
-    "$LLM_PROMPT" \
-    2>/dev/null || true)
-fi
-
-# If claude is not available or returned empty, fall back to raw parsed output
-if [ -z "$SUMMARY" ]; then
-  SUMMARY="$PARSED"
-fi
-
-# Append as a sub-heading under the session heading written by SessionStart
-# Include HTML comment anchor for progressive disclosure (L3 transcript lookup)
+# Write raw parsed content to the memory file — summarization happens later
+# via the memsearch-summarize PM2 service.
 {
   echo "### $NOW"
   if [ -n "$SESSION_ID" ]; then
     echo "<!-- session:${SESSION_ID} turn:${LAST_USER_TURN_UUID} transcript:${TRANSCRIPT_PATH} -->"
   fi
-  echo "$SUMMARY"
+  echo "$PARSED"
   echo ""
 } >> "$MEMORY_FILE"
 
-# Kill any previous background index before re-indexing to avoid process accumulation
-kill_orphaned_index
-
-# Index immediately — don't rely on watch (which may be killed by SessionEnd before debounce fires)
-run_memsearch index "$MEMORY_DIR"
+# Spool for the async summarization service (memsearch-summarize).
+SPOOL_DIR="$MEMSEARCH_DIR/spool"
+mkdir -p "$SPOOL_DIR"
+_SPOOL_FILE="$SPOOL_DIR/${SESSION_ID:-unknown}-$(date +%s).json"
+python3 -c "
+import json, sys
+spool = {
+    'session_id': sys.argv[1],
+    'transcript_path': sys.argv[2],
+    'memory_file': sys.argv[3],
+    'timestamp': sys.argv[4],
+    'turn_uuid': sys.argv[5],
+    'parsed_len': int(sys.argv[6])
+}
+with open(sys.argv[7], 'w', encoding='utf-8') as f:
+    json.dump(spool, f)
+" "$SESSION_ID" "$TRANSCRIPT_PATH" "$MEMORY_FILE" "$NOW" "$LAST_USER_TURN_UUID" "${#PARSED}" "$_SPOOL_FILE" 2>/dev/null || true
 
 echo '{}'
