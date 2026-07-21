@@ -56,6 +56,17 @@ def format_turn(lines):
         except Exception:
             continue
 
+        # Forge divergence from upstream: skip harness-synthetic meta turns.
+        # Claude Code writes skill loads (and other injected reminders) as a
+        # "user" entry whose content is the ENTIRE skill/template markdown file,
+        # flagged isMeta:true. Upstream format_turn() never checks isMeta, so that
+        # content was rendered verbatim into the transcript and the summarizer
+        # faithfully "summarized" it, leaking template placeholders (<name>,
+        # <specific step>) into .memsearch/memory/*.md. find_last_turn_start()
+        # already applies this exact guard; format_turn() was missing it.
+        if obj.get("isMeta"):
+            continue
+
         msg_type = obj.get("type", "")
 
         # Skip non-content types
