@@ -27,6 +27,22 @@
   <img src="https://github.com/user-attachments/assets/427b7152-bc16-408c-a8b0-59a2b05fd1e0" alt="memsearch demo" width="800">
 </p>
 
+## Forge fork
+
+This is forge's fork of `zilliztech/memsearch` (upstream, remote `upstream`), maintained at `TadMSTR/memsearch` (remote `origin`, branch `forge-main`). It powers forge's per-agent memory summarization pipeline.
+
+Fork baseline: v0.4.14. Upstream is currently one release ahead at v0.4.15 (non-security commits); reconciliation is deferred, not yet scheduled.
+
+Forge-specific patches on top of upstream — see `git log` on `forge-main` for the current list:
+- `parse-transcript.sh`: skip `isMeta` turns in `format_turn()`, so mid-session skill/template dumps never reach a memory file (root-cause fix for template placeholders leaking into `.memsearch/memory/*.md`)
+- Async spool stop hook re-ported onto v0.4.14
+- `UserPromptSubmit` hook upgraded to inject memsearch results
+- PATH fix for hook venv discovery (`/opt/venvs/memsearch/bin`)
+
+Check for upstream updates with `git fetch upstream --tags` before pulling in a new release.
+
+---
+
 ## 📰 What's New
 
 - **Skills from memory** — MemSearch now distills the workflows you repeat into reusable, installable agent skills (a third "procedural memory" layer) and keeps them up to date in the background. See [Skills from Memory](#skills-from-memory).
