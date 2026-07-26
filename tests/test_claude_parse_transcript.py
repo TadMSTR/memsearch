@@ -181,3 +181,36 @@ def test_claude_parse_transcript_skips_command_wrapper_as_last_turn(tmp_path: Pa
     assert "[User]: what is the deploy status?" in output
     assert "All green." in output
     assert "<command-name>" not in output
+
+
+def test_injected_prefix_drop_is_intentional_tradeoff(tmp_path: Path) -> None:
+    # Documents an accepted trade-off (audit INFO, 2026-07-26): the injected-prefix
+    # guard is exact-prefix-anchored, so a *real* user turn that literally begins with
+    # one of the four markers is dropped rather than preserved. This favours dropping
+    # over leaking skill/command bodies — the correct bias for the contamination fix.
+    # This test pins that behaviour so the prefix list can't be silently widened
+    # without a conscious update here.
+    transcript = tmp_path / "claude-falsepos.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {"type": "user", "uuid": "u0", "message": {"content": "explain the injection markers"}},
+            {
+                "type": "user",
+                "uuid": "u1",
+                "message": {"content": "<command-name> is the tag Claude Code injects, FYI"},
+            },
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Noted."}]},
+            },
+        ],
+    )
+
+    output = _run_parse(transcript)
+
+    # The turn beginning with the marker is dropped (accepted trade-off); the real
+    # preceding turn and the assistant reply are preserved.
+    assert "[User]: explain the injection markers" in output
+    assert "Noted." in output
+    assert "is the tag Claude Code injects" not in output
