@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
 
 from memsearch import compact as compact_module
+from memsearch.core import _compact_output_stem
 
 
 @pytest.mark.asyncio
@@ -124,3 +126,39 @@ async def test_compact_chunks_rejects_prompt_without_chunks_placeholder() -> Non
 async def test_compact_chunks_rejects_unknown_provider() -> None:
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         await compact_module.compact_chunks([{"content": "x"}], llm_provider="unknown")
+
+
+# ---------------------------------------------------------------------------
+# _compact_output_stem — output-file naming (date-collision fix)
+# ---------------------------------------------------------------------------
+
+
+def test_output_stem_uses_source_date_not_run_date() -> None:
+    # A compact of yesterday's source must land in *yesterday's* file, never
+    # the run-date file. logical_date is used for the in-file heading.
+    stem, logical = _compact_output_stem("/x/.memsearch/memory/2026-07-25.md", None)
+    assert stem == "2026-07-25"
+    assert logical == date(2026, 7, 25)
+
+
+def test_output_stem_falls_back_to_today_when_source_none() -> None:
+    stem, logical = _compact_output_stem(None, None)
+    assert stem == str(date.today())
+    assert logical == date.today()
+
+
+def test_output_stem_falls_back_to_today_for_non_date_source() -> None:
+    stem, logical = _compact_output_stem("/x/memory/session-notes.md", None)
+    assert stem == str(date.today())
+    assert logical == date.today()
+
+
+def test_output_name_overrides_stem_but_keeps_source_date_heading() -> None:
+    stem, logical = _compact_output_stem("/x/memory/2026-07-25.md", "developer-2026-07-25")
+    assert stem == "developer-2026-07-25"
+    assert logical == date(2026, 7, 25)
+
+
+def test_output_name_strips_md_suffix() -> None:
+    stem, _ = _compact_output_stem("/x/memory/2026-07-25.md", "developer-2026-07-25.md")
+    assert stem == "developer-2026-07-25"

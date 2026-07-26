@@ -22,6 +22,37 @@ from .store import MilvusStore
 logger = logging.getLogger(__name__)
 
 
+def _compact_output_stem(source: str | None, output_name: str | None) -> tuple[str, date]:
+    """Resolve the compact output filename stem and its logical date.
+
+    Precedence:
+    1. ``output_name`` — an explicit stem supplied by the caller (used verbatim
+       as the filename, minus any ``.md`` suffix).
+    2. The ``source`` file's basename when it parses as an ISO date
+       (``2026-07-25.md`` -> ``2026-07-25``) — so a compact of yesterday's
+       source lands in *yesterday's* file, not the run-date file.
+    3. ``date.today()`` as a last resort (``source is None`` or non-date name).
+
+    Returns ``(stem, logical_date)`` where ``logical_date`` is used for the
+    in-file ``# <date>`` heading.
+    """
+    source_date: date | None = None
+    if source:
+        try:
+            source_date = date.fromisoformat(Path(source).stem)
+        except ValueError:
+            source_date = None
+
+    logical_date = source_date or date.today()
+    if not output_name:
+        stem = str(logical_date)
+    elif output_name.endswith(".md"):
+        stem = output_name[:-3]
+    else:
+        stem = output_name
+    return stem, logical_date
+
+
 class MemSearch:
     """High-level API for semantic memory search.
 
@@ -235,6 +266,7 @@ class MemSearch:
         llm_model: str | None = None,
         prompt_template: str | None = None,
         output_dir: str | Path | None = None,
+        output_name: str | None = None,
         llm_base_url: str | None = None,
         llm_api_key: str | None = None,
     ) -> str:
@@ -259,6 +291,12 @@ class MemSearch:
         output_dir:
             Directory to write the compact file into.  Defaults to the
             first entry in *paths*.
+        output_name:
+            Explicit filename stem for the compact output (``.md`` suffix
+            optional).  When omitted, the stem is derived from *source*'s
+            basename if it is an ISO date, else from ``date.today()``.  Use
+            this to keep outputs from different projects/sources from
+            colliding in a shared *output_dir*.
         llm_base_url:
             Custom base URL for OpenAI-compatible API endpoints.  Only
             used when *llm_provider* is ``"openai"``.
@@ -287,15 +325,18 @@ class MemSearch:
             api_key=llm_api_key,
         )
 
-        # Write summary to memory/YYYY-MM-DD.md (append)
+        # Write summary to memory/<stem>.md.  The stem is keyed to the source
+        # file's date (or an explicit output_name), NOT the run date, and the
+        # write is idempotent (truncate, not append): re-compacting the same
+        # source replaces its file instead of accumulating duplicates.
         base = Path(output_dir) if output_dir else Path(self._paths[0]) if self._paths else Path.cwd()
         memory_dir = base / "memory"
         memory_dir.mkdir(parents=True, exist_ok=True)
-        compact_file = memory_dir / f"{date.today()}.md"
+        stem, logical_date = _compact_output_stem(source, output_name)
+        compact_file = memory_dir / f"{stem}.md"
         compact_heading = "\n\n## Memory Compact\n\n"
-        with open(compact_file, "a", encoding="utf-8") as f:
-            if compact_file.stat().st_size == 0:
-                f.write(f"# {date.today()}\n")
+        with open(compact_file, "w", encoding="utf-8") as f:
+            f.write(f"# {logical_date}\n")
             f.write(compact_heading)
             f.write(summary)
             f.write("\n")
