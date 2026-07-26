@@ -98,6 +98,12 @@ def test_compact_reads_prompt_file_and_passes_template(monkeypatch, tmp_path: Pa
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("Summarize carefully:\n{chunks}\n", encoding="utf-8")
 
+    # Isolate config so the test never reads the live ~/.memsearch/config.toml on
+    # forge — otherwise its [prompts].compact would shadow the --prompt-file under
+    # test and make this assertion environment-dependent (#247).
+    monkeypatch.setattr("memsearch.config.GLOBAL_CONFIG_PATH", tmp_path / "nope.toml")
+    monkeypatch.setattr("memsearch.config.PROJECT_CONFIG_PATH", tmp_path / "nope-project.toml")
+
     monkeypatch.setattr("memsearch.core.MemSearch", lambda **kwargs: DummyMemSearch())
 
     runner = CliRunner()

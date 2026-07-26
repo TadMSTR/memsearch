@@ -208,7 +208,7 @@ def test_session_start_recent_memory_selects_daily_journals() -> None:
         assert "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" in source
 
 
-def test_claude_stop_hook_writes_summary_without_safe_mode_flag(tmp_path: Path) -> None:
+def test_claude_stop_hook_writes_raw_turn_and_spools(tmp_path: Path) -> None:
     script = Path("plugins/claude-code/hooks/stop.sh")
     plugin_root = Path("plugins/claude-code").resolve()
     home = tmp_path / "home"
@@ -290,21 +290,33 @@ echo "- User discussed a macOS stop hook regression."
         check=True,
     )
 
+    # Forge divergence: stop.sh writes the RAW parsed turn to the daily memory
+    # file and drops a spool entry for the out-of-band memsearch-summarize
+    # service. It never shells out to `claude` for inline summarization (that
+    # upstream path was removed — see the hook header).
     memory_files = list((memsearch_dir / "memory").glob("*.md"))
     assert result.stdout.strip() == "{}"
     assert len(memory_files) == 1
     memory_text = memory_files[0].read_text(encoding="utf-8")
-    assert "macOS stop hook regression" in memory_text
+    assert "[User]: Summarize this session" in memory_text
+    assert "I explained the macOS hook issue." in memory_text
 
-    captured_args = claude_args.read_text(encoding="utf-8").splitlines()
-    assert captured_args[:4] == ["-p", "--strict-mcp-config", "--tools", ""]
-    assert "--safe-mode" not in captured_args
-    assert captured_args[captured_args.index("--model") + 1] == "haiku"
+    # A spool entry is dropped for the async summarizer.
+    spool_files = list((memsearch_dir / "spool").glob("*.json"))
+    assert len(spool_files) == 1
+
+    # `claude` is never invoked, so its args file is never written.
+    assert not claude_args.exists()
 
 
-def test_claude_stop_hook_avoids_empty_array_expansion_under_nounset() -> None:
+def test_claude_stop_hook_is_spool_based_without_inline_summarizer() -> None:
+    # The forge stop.sh removed upstream's inline `claude -p` summarization (and
+    # its CLAUDE_SAFE_MODE_ARGS array). It must not reference the unsafe empty-
+    # array expansion, and must drive the async spool contract instead.
     script = Path("plugins/claude-code/hooks/stop.sh")
     source = script.read_text(encoding="utf-8")
 
     assert '"${CLAUDE_SAFE_MODE_ARGS[@]}"' not in source
-    assert "CLAUDE_SAFE_MODE_ARG" in source
+    assert "CLAUDE_SAFE_MODE_ARG" not in source
+    assert "parse-transcript.sh" in source
+    assert "spool" in source
