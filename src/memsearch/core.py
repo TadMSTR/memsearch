@@ -13,7 +13,12 @@ if TYPE_CHECKING:
     from .watcher import FileWatcher
 
 from .chunker import Chunk, chunk_markdown, clean_content_for_embedding, compute_chunk_id
-from .compact import compact_chunks
+from .compact import COMPACT_PROMPT, compact_chunks
+from .contamination import (
+    COMPACT_RETRY_REMINDER,
+    build_compact_fallback_note,
+    detect_contamination,
+)
 from .embeddings import EmbeddingProvider, get_provider
 from .io import read_utf8_text_replace
 from .scanner import ScannedFile, scan_paths
@@ -311,6 +316,22 @@ class MemSearch:
         """
         from .store import _escape_filter_value
 
+        # Reindex-race guard (#245): the fast-tier watch daemon reindexes each
+        # per-project .memsearch/memory/ dir on a 60s loop. If a scoped compact
+        # queries its source while the daemon is mid delete-then-upsert of that
+        # dir, the query returns an empty set and compact wrongly reports
+        # "No chunks matched source". When *source* is an on-disk file, index it
+        # here first so compact is self-sufficient and never depends on daemon
+        # timing. Best-effort: a stat/index failure falls through to the query,
+        # preserving the prior behaviour.
+        if source:
+            src_path = Path(source).expanduser()
+            if src_path.is_file():
+                try:
+                    await self.index_file(src_path)
+                except Exception:
+                    logger.warning("compact: pre-index of source %s failed; querying existing chunks", source)
+
         filter_expr = f'source == "{_escape_filter_value(source)}"' if source else ""
         all_chunks = self._store.query(filter_expr=filter_expr)
         if not all_chunks:
@@ -324,6 +345,30 @@ class MemSearch:
             base_url=llm_base_url,
             api_key=llm_api_key,
         )
+
+        # Contamination backstop: if the model reproduced template/skill structure
+        # verbatim (a contaminated historical raw re-read into the chunk set), retry
+        # once with an anti-regurgitation reminder, then fall back to a deterministic
+        # note. Mirrors the summarize-layer guard.
+        raw_blob = "\n\n---\n\n".join(c["content"] for c in all_chunks)
+        reason = detect_contamination(summary, raw_blob)
+        if reason:
+            logger.warning("compact summary tripped contamination guard (%s); retrying once", reason)
+            base_template = prompt_template or COMPACT_PROMPT
+            summary = await compact_chunks(
+                all_chunks,
+                llm_provider=llm_provider,
+                model=llm_model,
+                prompt_template=base_template + COMPACT_RETRY_REMINDER,
+                base_url=llm_base_url,
+                api_key=llm_api_key,
+            )
+            reason = detect_contamination(summary, raw_blob)
+            if reason:
+                logger.warning(
+                    "compact summary still contaminated (%s) after retry; using deterministic fallback", reason
+                )
+                summary = build_compact_fallback_note(source)
 
         # Write summary to memory/<stem>.md.  The stem is keyed to the source
         # file's date (or an explicit output_name), NOT the run date, and the

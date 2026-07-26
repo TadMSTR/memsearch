@@ -30,6 +30,25 @@ python3 -c '
 import json, sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# Forge divergence: some harness-injected user turns are NOT flagged isMeta and
+# so slip past the isMeta guard below. Two known shapes leak verbatim into memory:
+#   - Slash-command invocation wrappers: a plain string turn beginning
+#     "<command-name>...".  (Verified non-isMeta.)
+#   - Skill-invocation bodies beginning "Base directory for this skill:".  These
+#     are normally isMeta (and already dropped), but this prefix guard is a cheap
+#     belt-and-suspenders in case a future harness build emits them non-isMeta.
+# Skip any user turn whose text begins with one of these markers.
+_INJECTED_PREFIXES = (
+    "Base directory for this skill:",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+)
+
+def _is_injected(text):
+    s = (text or "").lstrip()
+    return any(s.startswith(p) for p in _INJECTED_PREFIXES)
+
 def find_last_turn_start(lines):
     """Find the index of the last real user message (string or array-format content)."""
     for i in range(len(lines) - 1, -1, -1):
@@ -37,11 +56,11 @@ def find_last_turn_start(lines):
             obj = json.loads(lines[i])
             if obj.get("type") == "user" and not obj.get("isMeta"):
                 content = obj.get("message", {}).get("content")
-                if isinstance(content, str) and content.strip():
+                if isinstance(content, str) and content.strip() and not _is_injected(content):
                     return i
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip() and not _is_injected(block.get("text", "")):
                             return i
         except Exception:
             pass
@@ -75,7 +94,7 @@ def format_turn(lines):
 
         if msg_type == "user":
             content = obj.get("message", {}).get("content")
-            if isinstance(content, str) and content.strip():
+            if isinstance(content, str) and content.strip() and not _is_injected(content):
                 output.append(f"[User]: {content.strip()}")
             elif isinstance(content, list):
                 for block in content:
@@ -83,7 +102,7 @@ def format_turn(lines):
                         continue
                     if block.get("type") == "text":
                         text = block.get("text", "").strip()
-                        if text:
+                        if text and not _is_injected(text):
                             output.append(f"[User]: {text}")
                     # Skip tool_result blocks; they are structured execution metadata.
 

@@ -4,9 +4,9 @@ name: Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, forge-main]
   pull_request:
-    branches: [main]
+    branches: [main, forge-main]
 
 permissions:
   contents: read
