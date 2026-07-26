@@ -13,10 +13,12 @@ from memsearch.config import save_config
 class DummyMemSearch:
     last_source = None
     last_prompt_template = None
+    last_output_name = None
 
     async def compact(self, **kwargs):
         DummyMemSearch.last_source = kwargs["source"]
         DummyMemSearch.last_prompt_template = kwargs["prompt_template"]
+        DummyMemSearch.last_output_name = kwargs.get("output_name")
         return ""
 
     def close(self) -> None:
@@ -70,6 +72,23 @@ def test_compact_shows_matched_source_when_no_chunks(monkeypatch, tmp_path: Path
     assert result.exit_code == 0
     assert DummyMemSearch.last_source == str(note.resolve())
     assert f"No chunks matched source: {note.resolve()}" in result.output
+
+
+def test_compact_passes_output_name_through(monkeypatch, tmp_path: Path):
+    note = tmp_path / "memory" / "2026-07-25.md"
+    note.parent.mkdir()
+    note.write_text("# note\n")
+
+    monkeypatch.setattr("memsearch.core.MemSearch", lambda **kwargs: DummyMemSearch())
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["compact", "--source", str(note), "--output-name", "developer-2026-07-25"],
+    )
+
+    assert result.exit_code == 0
+    assert DummyMemSearch.last_output_name == "developer-2026-07-25"
 
 
 def test_compact_reads_prompt_file_and_passes_template(monkeypatch, tmp_path: Path):
