@@ -126,7 +126,9 @@ async def _compact_anthropic(prompt: str, model: str) -> str:
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
-    return resp.content[0].text
+    # Some models (e.g. claude-sonnet-5) can return a ThinkingBlock before the
+    # TextBlock; indexing content[0] unconditionally crashes on those responses.
+    return next((b.text for b in resp.content if b.type == "text"), "")
 
 
 async def _compact_gemini(prompt: str, model: str) -> str:
