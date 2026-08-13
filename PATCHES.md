@@ -189,9 +189,14 @@ for T in upstream/main forge-main; do echo "-- $T"; <paste probe>; echo "exit $?
 
 ## compact-thinking-block-tolerance
 
-- **status:** fork-only
+- **status:** pending-PR
 - **commits:** `f53f19b`, merge `12d473d`
-- **upstream-pr:** none — candidate, not forge-specific
+- **upstream-pr:** https://github.com/zilliztech/memsearch/pull/675 (opened 2026-08-13)
+  — submitted from a clean `upstream/main` base as `upstream-pr/thinking-block`, carrying
+  only the `compact.py` hunk plus two regression tests; the commit's other half
+  (`AGENT_WORKSPACE.md`) is forge-only and was deliberately left behind. **At the next
+  sync, check the `merged` boolean, not `state`** — a closed-unmerged PR often names the
+  PR that absorbed it, which then needs its own probe run.
 - **files:** `src/memsearch/compact.py`
 - **why:** `_compact_anthropic` read `resp.content[0].text` unconditionally. When the
   model returns a `ThinkingBlock` first — which any extended-thinking-capable model may
@@ -351,7 +356,7 @@ Recorded here so the next sync does not re-derive them.
 
 | Item | Note |
 |---|---|
-| `compact-thinking-block-tolerance` | Pure upstream bug, trivially reproducible, no forge coupling. Best first PR. |
+| `compact-thinking-block-tolerance` | **Submitted — zilliztech/memsearch#675, 2026-08-13.** Pure upstream bug, trivially reproducible, no forge coupling. |
 | `llm-config-resolution` | Both halves upstreamable; tracked as vikunja#371 / #372. |
 | `contamination-guard` | Generalisable, but the largest diff of the three — offer after the two above land. |
 | `compact.py` `api_key` ignored for anthropic/gemini; `compact_chunks` rejects `openai-compatible` while `summarize_text` accepts it | vikunja#376. Pre-existing upstream defect, found on the fork, not carried as a patch. |
