@@ -1,0 +1,28 @@
+# Enforce the forge plugin-version bump rule on every PR into forge-main (vikunja#249).
+#
+# forge-local workflow — not present upstream. Carry it across upstream syncs.
+
+name: Plugin Version
+
+on:
+  pull_request:
+    branches: [forge-main]
+
+permissions:
+  contents: read
+
+jobs:
+  version-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history: the check diffs against the merge-base with the target branch.
+          fetch-depth: 0
+
+      - name: Enforce plugin version bump
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./.github/scripts/check-plugin-version.sh
