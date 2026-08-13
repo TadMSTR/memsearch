@@ -36,3 +36,14 @@ AGENTS.local.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets
+.env
+*.env
+
+# Core dumps
+# NOTE: deliberately NOT `core.*` — this package ships src/memsearch/core.py, and a
+# bare `core.*` pattern silently excludes it from the built wheel while an editable
+# install keeps working, so the breakage only surfaces at real install time.
+core.[0-9]*
+*.core
