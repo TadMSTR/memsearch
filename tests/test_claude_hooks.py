@@ -601,7 +601,7 @@ exit 0
 #       precisely what orphaned 155 raw transcript blocks during the 2026-08
 #       Mistral outage. Closing it means changing the spool contract (the
 #       service reads the raw block back out of the memory file), not this test.
-#       See PATCHES.md :: async-spool-stop-hook, and vikunja#385.
+#       See PATCHES.md :: async-spool-stop-hook, and vikunja#386.
 
 
 def test_claude_stop_hook_writes_raw_turn_and_spools(tmp_path: Path) -> None:
