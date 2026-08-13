@@ -53,11 +53,17 @@ _PARAM_MAP = {
     "collection": "milvus.collection",
     "milvus_uri": "milvus.uri",
     "milvus_token": "milvus.token",
-    "llm_provider": "compact.llm_provider",
-    "llm_model": "compact.llm_model",
+    # The --llm-* flags target [llm], not the deprecated [compact]. Pointing them at
+    # [compact] made them unusable: compact reads `cfg.llm.X or cfg.compact.X`, so any
+    # populated [llm] section silently beat every flag the user passed. Worse than
+    # ignored — `--llm-provider openai --llm-api-key <key>` was accepted and then raised
+    # an *Anthropic* auth error, sending you to debug the wrong provider entirely.
+    "llm_provider": "llm.provider",
+    "llm_model": "llm.model",
+    "llm_base_url": "llm.base_url",
+    "llm_api_key": "llm.api_key",
+    # --prompt-file has no [llm] equivalent; [compact].prompt_file is still its home.
     "prompt_file": "compact.prompt_file",
-    "llm_base_url": "compact.base_url",
-    "llm_api_key": "compact.api_key",
     "max_chunk_size": "chunking.max_chunk_size",
     "overlap_lines": "chunking.overlap_lines",
     "debounce_ms": "watch.debounce_ms",
@@ -606,7 +612,9 @@ def compact(
     if not prompt_template and cfg.compact.prompt_file:
         prompt_template = Path(cfg.compact.prompt_file).read_text(encoding="utf-8")
 
-    # Resolve LLM settings: [llm] > [compact] (deprecated) > defaults
+    # Resolve LLM settings: [llm] > [compact] (deprecated) > defaults.
+    # The --llm-* flags land in [llm] via _PARAM_MAP and cli_overrides merges last
+    # (resolve_config: defaults -> global -> project -> CLI), so a flag wins here.
     eff_provider = cfg.llm.provider or cfg.compact.llm_provider
     eff_model = cfg.llm.model or cfg.compact.llm_model or None
     eff_base_url = cfg.llm.base_url or cfg.compact.base_url or None

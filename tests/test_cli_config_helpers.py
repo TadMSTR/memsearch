@@ -39,12 +39,18 @@ def test_build_cli_overrides_maps_only_non_none_values() -> None:
             "collection": "custom_chunks",
             "uri": "http://localhost:19530",
         },
-        "compact": {
-            "llm_provider": "gemini",
-            "llm_model": "gemini-3-flash-preview",
-            "prompt_file": "prompts/compact.txt",
+        # The --llm-* flags target [llm]. They used to land in the deprecated [compact]
+        # section, where compact's `cfg.llm.X or cfg.compact.X` resolution meant a
+        # populated [llm] silently discarded every one of them.
+        "llm": {
+            "provider": "gemini",
+            "model": "gemini-3-flash-preview",
             "base_url": "https://llm.example.com",
             "api_key": "env:LLM_KEY",
+        },
+        # --prompt-file has no [llm] equivalent and stays where it was.
+        "compact": {
+            "prompt_file": "prompts/compact.txt",
         },
         "chunking": {
             "max_chunk_size": 2048,
