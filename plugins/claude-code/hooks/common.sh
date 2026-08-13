@@ -22,9 +22,24 @@ else
 fi
 
 # Ensure common user bin paths are in PATH (hooks may run in a minimal env)
-for p in "/opt/venvs/memsearch/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "/usr/local/bin"; do
+for p in "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "/usr/local/bin"; do
   [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
+
+# forge: memsearch lives in a venv at /opt/venvs/memsearch/bin. The loop above
+# only finds it via the $HOME/.local/bin symlink, so a hook running under a
+# minimal or non-standard HOME detects no memsearch at all and silently skips
+# session summarization (original fix: 0f485f0).
+#
+# Deliberately a *fallback*, not a prepend: consulted only when nothing on the
+# caller's PATH already provides memsearch. Prepending it unconditionally also
+# shadowed memsearch binaries supplied on PATH by the caller, which is how the
+# hook tests inject their stubs — they set HOME to a tmpdir precisely to get a
+# minimal env, so the venv won and the tests exercised the real forge install
+# and the real config instead of their fixtures (vikunja#375).
+if ! command -v memsearch &>/dev/null && [[ -d "/opt/venvs/memsearch/bin" ]]; then
+  export PATH="/opt/venvs/memsearch/bin:$PATH"
+fi
 
 # Memory directory and memsearch state directory are project-scoped.
 # Prefer git root to avoid .memsearch scattered in subdirectories when
