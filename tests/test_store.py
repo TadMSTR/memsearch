@@ -1,10 +1,38 @@
 """Tests for the Milvus store."""
 
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import pytest
 
 from memsearch.store import MilvusStore
+
+
+def _milvus_lite_major() -> int:
+    """Major version of the installed milvus-lite, or 0 when it is absent."""
+    try:
+        return int(version("milvus-lite").split(".", 1)[0])
+    except (PackageNotFoundError, ValueError):
+        return 0
+
+
+# milvus-lite 3.x accepts a collection description on create and then reports it
+# back as "" — the DDL reaches an AllocTimestamp RPC the embedded server does not
+# implement, and the description is dropped rather than raising. Environment
+# drift, not a defect in this code: uv.lock pins milvus-lite 2.5.1, where this
+# passes (CI is green), while the forge venv at /opt/venvs/memsearch resolved
+# milvus-lite 3.0 / pymilvus 3.0.0 outside the lock (vikunja#375, #384).
+#
+# Version-gated so it only applies where the behaviour is real: under the locked
+# 2.x this runs normally. strict=True on purpose — if a later milvus-lite 3.x
+# restores descriptions, the XPASS fails loudly and this marker gets removed
+# rather than quietly outliving the bug. Recheck after the upstream sync;
+# upstream d5809d7 reworks store.py and test_store.py.
+_MILVUS_LITE_DROPS_DESCRIPTION = pytest.mark.xfail(
+    _milvus_lite_major() >= 3,
+    reason="milvus-lite 3.x drops the collection description (AllocTimestamp unimplemented)",
+    strict=True,
+)
 
 
 @pytest.fixture
@@ -186,6 +214,7 @@ def test_drop(store: MilvusStore):
     assert len(results) == 0
 
 
+@_MILVUS_LITE_DROPS_DESCRIPTION
 def test_collection_description(tmp_path: Path):
     """Collection should store the description when provided."""
     db = str(tmp_path / "desc_test.db")
