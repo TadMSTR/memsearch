@@ -261,21 +261,49 @@ def resolve_env_ref(value: str) -> str:
     return env_val
 
 
+#: Config keys whose ``env:`` refs survive config load unresolved and are resolved at the
+#: point of use instead. See :func:`_is_lazily_resolved`.
+_LAZY_ENV_PATHS = frozenset({("llm", "api_key"), ("compact", "api_key")})
+
+
+def _is_lazily_resolved(child_path: tuple[str, ...]) -> bool:
+    """True if this key's ``env:`` ref must be left raw at config-load time.
+
+    Resolving an ``env:`` ref eagerly makes *every* command that loads config depend on a
+    credential that almost none of them use.  On forge that broke ``memsearch index`` — a
+    pure embedding operation with no LLM call anywhere in it — because ``[llm].api_key``
+    happened to be ``env:MISTRAL_API_KEY``.  The workaround was to inject that key into
+    every caller, which spread a live API credential to a cron and a network-facing MCP
+    that never make an LLM request (vikunja#372).
+
+    Named providers under ``[llm.providers.<name>]`` were already exempt for exactly this
+    reason.  The two entries in :data:`_LAZY_ENV_PATHS` are the same case one level up.
+
+    This does not hide a missing key.  Both consumers resolve at the point of use —
+    ``compact.py`` and ``maintenance.py`` each call :func:`resolve_env_ref` before building
+    a client — so an unset variable still raises :class:`ConfigEnvVarError` with the same
+    message.  It just raises in the command that actually needs the key rather than in
+    every command that does not.
+    """
+    if child_path in _LAZY_ENV_PATHS:
+        return True
+    # [llm.providers.<name>.<field>] — selected lazily by plugin summarization.
+    return len(child_path) == 4 and child_path[0] == "llm" and child_path[1] == "providers"
+
+
 def _resolve_env_refs_in_dict(d: dict[str, Any], path: tuple[str, ...] = ()) -> dict[str, Any]:
-    """Walk a nested config dict and resolve all ``env:`` references."""
+    """Walk a nested config dict and resolve all ``env:`` references.
+
+    Keys matched by :func:`_is_lazily_resolved` keep their raw ``env:`` string; everything
+    else resolves here.
+    """
     resolved = {}
     for key, val in d.items():
         child_path = (*path, key)
         if isinstance(val, dict):
             resolved[key] = _resolve_env_refs_in_dict(val, child_path)
         elif isinstance(val, str) and val.startswith(_ENV_PREFIX):
-            if len(child_path) == 4 and child_path[0] == "llm" and child_path[1] == "providers":
-                # Named LLM providers are selected lazily by plugin summarization.
-                # Keep env refs raw here so unused providers do not break unrelated
-                # config commands. The selected provider resolves env refs when used.
-                resolved[key] = val
-            else:
-                resolved[key] = resolve_env_ref(val)
+            resolved[key] = val if _is_lazily_resolved(child_path) else resolve_env_ref(val)
         else:
             resolved[key] = val
     return resolved

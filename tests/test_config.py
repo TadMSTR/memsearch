@@ -558,8 +558,14 @@ def test_compact_config_new_fields():
     assert cfg.api_key == ""
 
 
-def test_compact_config_env_ref_resolved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """resolve_config should resolve env: references in compact.api_key and compact.base_url."""
+def test_compact_config_env_ref_deferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """compact.api_key keeps its env: ref at load time; non-secret values still resolve.
+
+    Was test_compact_config_env_ref_resolved, which asserted the opposite. Resolving an
+    LLM credential during config load makes every command that loads config — index,
+    search, status — fail when the variable is unset, even though none of them make an
+    LLM call. The key resolves at the point of use instead (compact.py).
+    """
     monkeypatch.setenv("TEST_LLM_KEY", "sk-llm-from-env")
 
     cfg_file = tmp_path / "config.toml"
@@ -577,7 +583,8 @@ def test_compact_config_env_ref_resolved(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr("memsearch.config.PROJECT_CONFIG_PATH", tmp_path / "nope.toml")
 
     cfg = resolve_config()
-    assert cfg.compact.api_key == "sk-llm-from-env"
+    assert cfg.compact.api_key == "env:TEST_LLM_KEY"
+    # base_url is not a credential and nothing defers it — it still resolves eagerly.
     assert cfg.compact.base_url == "https://my-llm-endpoint.com"
 
 
