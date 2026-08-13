@@ -6,6 +6,30 @@ import subprocess
 from pathlib import Path
 
 
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _write_claude_transcript(path: Path, *, turn_uuid: str) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "message": {"content": "start"}}),
+                json.dumps({"type": "user", "uuid": turn_uuid, "message": {"content": "Summarize this session"}}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "I explained the hook behavior."}]},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_claude_hook_memsearch_disable_exits_before_writing_memory(tmp_path: Path) -> None:
     script = Path("plugins/claude-code/hooks/session-start.sh")
     env = {
@@ -26,6 +50,61 @@ def test_claude_hook_memsearch_disable_exits_before_writing_memory(tmp_path: Pat
 
     assert result.stdout.strip() == "{}"
     assert not (tmp_path / ".memsearch").exists()
+
+
+def test_claude_session_start_does_not_create_journal(tmp_path: Path) -> None:
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    home.mkdir()
+    fake_bin.mkdir()
+    (home / ".memsearch").mkdir()
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"","api_key":""},"milvus":{"uri":"http://localhost:19530"}}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.4.16"
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(
+        fake_bin / "curl",
+        """#!/usr/bin/env bash
+echo '{"info":{"version":"0.4.16"}}'
+""",
+    )
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "MEMSEARCH_NO_WATCH": "1",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    memory_dir = memsearch_dir / "memory"
+    assert "systemMessage" in payload
+    assert memory_dir.is_dir()
+    assert list(memory_dir.glob("*.md")) == []
 
 
 def test_claude_session_start_recent_memory_skips_empty_sessions(tmp_path: Path) -> None:
@@ -66,6 +145,10 @@ def test_claude_session_start_recent_memory_skips_empty_sessions(tmp_path: Path)
     fake_memsearch = fake_bin / "memsearch"
     fake_memsearch.write_text(
         """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"","api_key":""},"milvus":{"uri":"~/.memsearch/milvus.db"}}'
+  exit 0
+fi
 if [ "$1" = "config" ] && [ "$2" = "get" ]; then
   case "$3" in
     embedding.provider) echo "onnx" ;;
@@ -131,6 +214,10 @@ def test_claude_session_start_uv_tool_upgrade_hint_preserves_extras(tmp_path: Pa
     fake_memsearch = uv_tool_bin / "memsearch"
     fake_memsearch.write_text(
         """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"voyage","model":"voyage-3-lite","api_key":""},"milvus":{"uri":"http://localhost:19530"}}'
+  exit 0
+fi
 if [ "$1" = "config" ] && [ "$2" = "get" ]; then
   case "$3" in
     embedding.provider) echo "voyage" ;;
@@ -184,6 +271,140 @@ echo '{"info":{"version":"0.4.13"}}'
     assert "uv tool install -U 'memsearch[onnx]'" not in status
 
 
+def test_claude_session_start_reads_resolved_config_once(tmp_path: Path) -> None:
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    call_log = tmp_path / "memsearch-calls.txt"
+    home.mkdir()
+    fake_bin.mkdir()
+    memsearch_dir.mkdir()
+    (home / ".memsearch").mkdir()
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+
+    fake_memsearch = fake_bin / "memsearch"
+    fake_memsearch.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"voyage","model":"voyage-3-lite","api_key":"configured-key"},"milvus":{"uri":"http://localhost:19530"}}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.4.15"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_memsearch.chmod(0o755)
+
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text("""#!/usr/bin/env bash\necho '{"info":{"version":"0.4.15"}}'\n""", encoding="utf-8")
+    fake_curl.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "MEMSEARCH_NO_WATCH": "1",
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "VOYAGE_API_KEY": "",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "embedding: voyage/voyage-3-lite" in status
+    assert "ERROR: VOYAGE_API_KEY not set" not in status
+    assert calls.count("config list --resolved --json-output") == 1
+    assert not any(call.startswith("config get ") for call in calls)
+    assert not any(call.startswith("skills status ") for call in calls)
+
+
+def test_claude_session_start_falls_back_for_older_cli(tmp_path: Path) -> None:
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    call_log = tmp_path / "memsearch-calls.txt"
+    home.mkdir()
+    fake_bin.mkdir()
+    memsearch_dir.mkdir()
+    (home / ".memsearch").mkdir()
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+
+    fake_memsearch = fake_bin / "memsearch"
+    fake_memsearch.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  exit 2
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "voyage" ;;
+    embedding.model) echo "voyage-3-lite" ;;
+    embedding.api_key) echo "configured-key" ;;
+    milvus.uri) echo "http://localhost:19530" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.4.14"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_memsearch.chmod(0o755)
+
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text("""#!/usr/bin/env bash\necho '{"info":{"version":"0.4.14"}}'\n""", encoding="utf-8")
+    fake_curl.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "MEMSEARCH_NO_WATCH": "1",
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "VOYAGE_API_KEY": "",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "embedding: voyage/voyage-3-lite" in status
+    assert "ERROR: VOYAGE_API_KEY not set" not in status
+    assert calls.count("config list --resolved --json-output") == 1
+    assert "config get embedding.provider" in calls
+    assert "config get embedding.model" in calls
+    assert "config get milvus.uri" in calls
+    assert "config get embedding.api_key" in calls
+
+
 def test_session_start_upgrade_hints_do_not_clobber_extras() -> None:
     for script in (
         Path("plugins/claude-code/hooks/session-start.sh"),
@@ -206,6 +427,181 @@ def test_session_start_recent_memory_selects_daily_journals() -> None:
 
         assert "DAILY_JOURNAL_PATTERN" in source
         assert "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" in source
+
+
+def test_session_start_warns_when_index_state_is_unhealthy(tmp_path: Path) -> None:
+    for name, script in (
+        ("claude", Path("plugins/claude-code/hooks/session-start.sh")),
+        ("codex", Path("plugins/codex/hooks/session-start.sh")),
+    ):
+        project = tmp_path / name
+        home = project / "home"
+        fake_bin = project / "bin"
+        memsearch_dir = project / ".memsearch"
+        home.mkdir(parents=True)
+        fake_bin.mkdir()
+        memsearch_dir.mkdir()
+        (memsearch_dir / ".index-state.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "error",
+                    "last_error": "RuntimeError: store unavailable",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        fake_memsearch = fake_bin / "memsearch"
+        fake_memsearch.write_text(
+            """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"","api_key":""},"milvus":{"uri":"http://localhost:19530"}}'
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    embedding.model) echo "" ;;
+    milvus.uri) echo "http://localhost:19530" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.4.14"
+  exit 0
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        fake_memsearch.chmod(0o755)
+
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text("""#!/usr/bin/env bash\necho '{"info":{"version":"0.4.14"}}'\n""", encoding="utf-8")
+        fake_curl.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECT_DIR": str(project),
+            "MEMSEARCH_PROJECT_DIR": str(project),
+            "MEMSEARCH_DIR": str(memsearch_dir),
+            "MEMSEARCH_NO_WATCH": "1",
+        }
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps({"cwd": str(project)}),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+
+        status = json.loads(result.stdout)["systemMessage"]
+        assert "WARNING: memory index may be stale" in status
+        assert "memory-config skill" in status
+
+
+def test_session_start_shows_skill_candidate_hint(tmp_path: Path) -> None:
+    hint = "SKILLS: 2 candidate skill version(s) pending install - run the memory-to-skill skill to review and install."
+    for name, script in (
+        ("claude", Path("plugins/claude-code/hooks/session-start.sh")),
+        ("codex", Path("plugins/codex/hooks/session-start.sh")),
+    ):
+        project = tmp_path / name
+        home = project / "home"
+        fake_bin = project / "bin"
+        memsearch_dir = project / ".memsearch"
+        home.mkdir(parents=True)
+        fake_bin.mkdir()
+        memsearch_dir.mkdir()
+        (memsearch_dir / "skill-candidates").mkdir()
+
+        fake_memsearch = fake_bin / "memsearch"
+        fake_memsearch.write_text(
+            f"""#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{{"embedding":{{"provider":"onnx","model":"","api_key":""}},"milvus":{{"uri":"http://localhost:19530"}}}}'
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    embedding.model) echo "" ;;
+    milvus.uri) echo "http://localhost:19530" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "skills" ] && [ "$2" = "status" ] && [ "$3" = "--hint" ]; then
+  echo "{hint}"
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.4.14"
+  exit 0
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        fake_memsearch.chmod(0o755)
+
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text("""#!/usr/bin/env bash\necho '{"info":{"version":"0.4.14"}}'\n""", encoding="utf-8")
+        fake_curl.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECT_DIR": str(project),
+            "MEMSEARCH_PROJECT_DIR": str(project),
+            "MEMSEARCH_DIR": str(memsearch_dir),
+            "MEMSEARCH_NO_WATCH": "1",
+        }
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps({"cwd": str(project)}),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+
+        status = json.loads(result.stdout)["systemMessage"]
+        assert hint in status
+
+
+# Upstream stop-hook tests deliberately NOT carried onto the fork (sync to
+# upstream/main @ d5809d7, 2026-08-13). Recorded here so a later reader can tell
+# "intentionally retired" from "lost in a merge":
+#
+#   test_claude_stop_hook_writes_summary_without_safe_mode_flag
+#   test_claude_stop_hook_sends_large_native_prompt_on_stdin
+#       Both assert upstream's INLINE `claude -p` summarization. The forge hook
+#       has no inline summarizer at all — memsearch-summarize does it out of
+#       band — so there is no code path for either to exercise.
+#
+#   test_claude_stop_hook_avoids_empty_array_expansion_under_nounset
+#       Not dropped, RENAMED. It is the same body, extended, and now runs as
+#       test_claude_stop_hook_is_spool_based_without_inline_summarizer below.
+#
+#   test_claude_stop_hook_failure_never_persists_transcript
+#       ** This one is a KNOWN GAP, not an inapplicable test. ** It asserts
+#       upstream 1c82054's property: when the summarizer fails, transcript
+#       content is never written to memory. The forge hook writes the raw turn
+#       unconditionally and relies on memsearch-summarize to replace it, so this
+#       test FAILS on forge by design of the current architecture — which is
+#       precisely what orphaned 155 raw transcript blocks during the 2026-08
+#       Mistral outage. Closing it means changing the spool contract (the
+#       service reads the raw block back out of the memory file), not this test.
+#       See PATCHES.md :: async-spool-stop-hook, and vikunja#386.
 
 
 def test_claude_stop_hook_writes_raw_turn_and_spools(tmp_path: Path) -> None:
@@ -307,6 +703,103 @@ echo "- User discussed a macOS stop hook regression."
 
     # `claude` is never invoked, so its args file is never written.
     assert not claude_args.exists()
+
+
+def test_claude_stop_hook_groups_session_headings(tmp_path: Path) -> None:
+    script = Path("plugins/claude-code/hooks/stop.sh")
+    plugin_root = Path("plugins/claude-code").resolve()
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    transcript_a = tmp_path / "session-a.jsonl"
+    transcript_b = tmp_path / "session-b.jsonl"
+    home.mkdir()
+    fake_bin.mkdir()
+    _write_claude_transcript(transcript_a, turn_uuid="turn-a")
+    _write_claude_transcript(transcript_b, turn_uuid="turn-b")
+
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    plugins.claude-code.summarize.enabled) echo "true" ;;
+    plugins.claude-code.summarize.model) echo "" ;;
+    plugins.claude-code.summarize.provider) echo "" ;;
+    prompts.summarize) echo "" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "index" ]; then
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "--help" ]; then
+  echo "Usage: claude"
+  exit 0
+fi
+echo "- Captured a session summary."
+""",
+    )
+    _write_executable(
+        fake_bin / "date",
+        """#!/usr/bin/env bash
+case "${1:-}" in
+  +%Y-%m-%d) echo "2026-07-23" ;;
+  +%H:%M) echo "12:34" ;;
+  *) /bin/date "$@" ;;
+esac
+""",
+    )
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+    }
+
+    def run_stop(transcript: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps({"transcript_path": str(transcript)}),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert result.stdout.strip() == "{}"
+
+    memory_file = memsearch_dir / "memory" / "2026-07-23.md"
+
+    run_stop(transcript_a)
+    memory_text = memory_file.read_text(encoding="utf-8")
+    assert memory_text.count("## Session 12:34") == 1
+    assert memory_text.count("### 12:34") == 1
+    assert memory_text.count("session:session-a ") == 1
+
+    run_stop(transcript_a)
+    memory_text = memory_file.read_text(encoding="utf-8")
+    assert memory_text.count("## Session 12:34") == 1
+    assert memory_text.count("### 12:34") == 2
+    assert memory_text.count("session:session-a ") == 2
+
+    run_stop(transcript_b)
+    memory_text = memory_file.read_text(encoding="utf-8")
+    sections = memory_text.split("## Session 12:34")
+    assert len(sections) == 3
+    assert sections[1].count("session:session-a ") == 2
+    assert "session:session-b " not in sections[1]
+    assert sections[2].count("session:session-b ") == 1
 
 
 def test_claude_stop_hook_is_spool_based_without_inline_summarizer() -> None:

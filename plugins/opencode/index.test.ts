@@ -1,15 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  getSkillCandidateHint,
   getRecentMemories,
   isDailyJournalFile,
   mergeSystemMemoryContext,
   MEMSEARCH_SYSTEM_MARKER,
-} from "./index.ts";
+} from "./context.ts";
+
+test("plugin entry exposes only the default plugin function", async () => {
+  const mod = await import("./index.ts");
+
+  assert.deepEqual(Object.keys(mod), ["default"]);
+  assert.equal(typeof mod.default, "function");
+});
 
 test("appends memory context when no system entry exists yet", () => {
   const result = mergeSystemMemoryContext(undefined, `${MEMSEARCH_SYSTEM_MARKER} ctx-a`);
@@ -85,5 +93,32 @@ test("recent memories only use dated daily journals", () => {
     assert.doesNotMatch(context, /Scratch content/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("skill candidate hint comes from memsearch status", () => {
+  const root = mkdtempSync(join(tmpdir(), "memsearch-opencode-skills-"));
+  try {
+    const bin = join(root, "bin");
+    const memsearchDir = join(root, ".memsearch");
+    mkdirSync(bin);
+    mkdirSync(memsearchDir);
+    const fakeMemsearch = join(bin, "memsearch");
+    writeFileSync(
+      fakeMemsearch,
+      "#!/usr/bin/env bash\n" +
+        "test \"$MEMSEARCH_DIR\" = \"$1\" && shift\n" +
+        "if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"status\" ] && [ \"$3\" = \"--hint\" ]; then\n" +
+        "  echo 'SKILLS: 1 candidate skill version(s) pending install - run the memory-to-skill skill to review and install.'\n" +
+        "fi\n",
+      "utf-8"
+    );
+    chmodSync(fakeMemsearch, 0o755);
+
+    const hint = getSkillCandidateHint(memsearchDir, `${fakeMemsearch} '${memsearchDir}'`);
+
+    assert.match(hint, /SKILLS: 1 candidate skill version/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

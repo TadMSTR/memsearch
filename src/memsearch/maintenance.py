@@ -227,7 +227,14 @@ def _build_prompt(ctx: TaskContext, cfg: MemSearchConfig) -> str:
         template = template.replace(marker, value)
 
     existing = ctx.output_file.read_text(encoding="utf-8") if ctx.output_file.is_file() else ""
-    journals = _read_recent_journals(ctx.input_dir)
+    journal_budget = max(
+        0,
+        MAX_PROMPT_CHARS - len(template) - len(existing) - 512,
+    )
+    journals = _read_recent_journals(
+        ctx.input_dir,
+        budget=journal_budget,
+    )
     prompt = f"""{template}
 
 ## Existing output file
@@ -261,15 +268,30 @@ def _load_prompt_template(task: str, cfg: MemSearchConfig) -> str:
         return f.read()
 
 
-def _read_recent_journals(input_dir: Path, max_files: int = 12) -> str:
+def _read_recent_journals(
+    input_dir: Path,
+    max_files: int = 12,
+    budget: int | None = None,
+) -> str:
     if not input_dir.is_dir():
         return ""
     chunks: list[str] = []
-    files = sorted((p for p in input_dir.rglob("*.md") if p.is_file()), key=lambda p: p.stat().st_mtime)[-max_files:]
+    files = sorted(
+        (p for p in input_dir.rglob("*.md") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+    )[-max_files:]
     for path in files:
         with contextlib.suppress(OSError):
             chunks.append(f"\n<!-- source:{path} -->\n{read_utf8_text_replace(path)}")
-    return "\n".join(chunks)
+    text = "\n".join(chunks)
+    if budget is None or len(text) <= budget:
+        return text
+    if budget <= 0:
+        return ""
+    marker = "[older journal entries truncated]\n"
+    if budget <= len(marker):
+        return text[-budget:]
+    return marker + text[-(budget - len(marker)) :]
 
 
 def run_task_llm(ctx: TaskContext, prompt: str, cfg: MemSearchConfig) -> str:
@@ -550,10 +572,75 @@ def _parse_task_response(raw: str) -> dict[str, str]:
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         text = match.group(1)
+
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Maintenance LLM did not return valid JSON: {e}") from e
+    except json.JSONDecodeError as initial_error:
+        decoder = json.JSONDecoder()
+        last_object: dict[str, Any] | None = None
+        last_action_object: dict[str, Any] | None = None
+
+        cursor = 0
+        while True:
+            brace = text.find("{", cursor)
+            bracket = text.find("[", cursor)
+            starts = [position for position in (brace, bracket) if position >= 0]
+            if not starts:
+                break
+            start = min(starts)
+
+            try:
+                candidate, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                stack: list[str] = []
+                in_string = False
+                escaped = False
+                balanced_end: int | None = None
+
+                for index in range(start, len(text)):
+                    char = text[index]
+
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif char == "\\":
+                            escaped = True
+                        elif char == '"':
+                            in_string = False
+                        continue
+
+                    if char == '"':
+                        in_string = True
+                    elif char in "{[":
+                        stack.append(char)
+                    elif char in "}]":
+                        expected = "{" if char == "}" else "["
+                        if not stack or stack[-1] != expected:
+                            break
+                        stack.pop()
+                        if not stack:
+                            balanced_end = index + 1
+                            break
+
+                if balanced_end is None:
+                    break
+
+                cursor = balanced_end
+                continue
+
+            cursor = end
+
+            if not isinstance(candidate, dict):
+                continue
+
+            last_object = candidate
+            if "action" in candidate:
+                last_action_object = candidate
+
+        data = last_action_object or last_object
+        if data is None:
+            raise RuntimeError(f"Maintenance LLM did not return valid JSON: {initial_error}") from initial_error
+
     action = data.get("action")
     if action not in {"none", "replace"}:
         raise RuntimeError("Maintenance LLM action must be 'none' or 'replace'")
