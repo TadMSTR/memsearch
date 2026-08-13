@@ -98,7 +98,28 @@ print(uuid)
 
 # Write raw parsed content to the memory file — summarization happens later
 # via the memsearch-summarize PM2 service.
+#
+# Upstream's inline summarizer block sits here (prompt load, claude -p /
+# memsearch summarize, and 1c82054's bounded "summary unavailable" diagnostic).
+# It is deliberately absent on forge: this hook does not summarize at all, so
+# there is no failure branch here for that diagnostic to guard. 1c82054 is NOT
+# superseding this patch — it fixes upstream's inline path, which forge does
+# not run. See PATCHES.md :: async-spool-stop-hook.
+#
+# KNOWN GAP (not introduced by the sync): the raw write below is unconditional
+# and is only transient because memsearch-summarize replaces it. When that
+# service cannot reach the LLM it returns retry/error and the raw block stays
+# in the memory file — the path that orphaned 155 transcript blocks during the
+# 2026-08 Mistral outage. The service reads this raw block to summarize it, so
+# closing the gap means changing the spool contract, not this line.
+#
+# The append below adopts upstream e657b05's LAZY session heading: SessionStart
+# no longer writes "## Session HH:MM" eagerly, so this hook writes it on the
+# first content-bearing Stop, keyed on the session: anchor.
 {
+  if [ -z "$SESSION_ID" ] || ! grep -qF "session:${SESSION_ID}" "$MEMORY_FILE" 2>/dev/null; then
+    echo -e "\n## Session $NOW\n"
+  fi
   echo "### $NOW"
   if [ -n "$SESSION_ID" ]; then
     echo "<!-- session:${SESSION_ID} turn:${LAST_USER_TURN_UUID} transcript:${TRANSCRIPT_PATH} -->"

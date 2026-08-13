@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,16 @@ from types import SimpleNamespace
 import pytest
 
 from memsearch.config import LLMProviderConfig, MemSearchConfig, PluginMaintenanceTaskConfig
-from memsearch.maintenance import TaskContext, _read_recent_journals, run_due_tasks, run_memory_command, run_task_llm
+from memsearch.maintenance import (
+    MAX_PROMPT_CHARS,
+    TaskContext,
+    _build_prompt,
+    _parse_task_response,
+    _read_recent_journals,
+    run_due_tasks,
+    run_memory_command,
+    run_task_llm,
+)
 
 
 def test_maintenance_routes_gemini_provider_to_tool_runner(tmp_path: Path, monkeypatch) -> None:
@@ -46,6 +56,263 @@ def test_read_recent_journals_replaces_invalid_utf8_bytes(tmp_path: Path) -> Non
 
     assert "<!-- source:" in journals
     assert "broken \ufffd byte" in journals
+
+
+def test_read_recent_journals_respects_max_files(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+
+    oldest = memory / "2026-07-25.md"
+    middle = memory / "2026-07-26.md"
+    newest = memory / "2026-07-27.md"
+
+    oldest.write_text("OLDEST_JOURNAL_MARKER\n", encoding="utf-8")
+    middle.write_text("MIDDLE_JOURNAL_MARKER\n", encoding="utf-8")
+    newest.write_text("NEWEST_JOURNAL_MARKER\n", encoding="utf-8")
+
+    os.utime(oldest, (100, 100))
+    os.utime(middle, (200, 200))
+    os.utime(newest, (300, 300))
+
+    journals = _read_recent_journals(memory, max_files=2)
+
+    assert "NEWEST_JOURNAL_MARKER" in journals
+    assert "MIDDLE_JOURNAL_MARKER" in journals
+    assert "OLDEST_JOURNAL_MARKER" not in journals
+    assert journals.index("MIDDLE_JOURNAL_MARKER") < journals.index("NEWEST_JOURNAL_MARKER")
+
+
+def test_build_prompt_preserves_newest_journal_when_corpus_exceeds_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "repo"
+    memory = project / ".memsearch" / "memory"
+    memory.mkdir(parents=True)
+
+    oldest = memory / "2026-07-26.md"
+    newest = memory / "2026-07-27.md"
+
+    oldest.write_text(
+        "OLDEST_JOURNAL_MARKER\n" + "x" * (MAX_PROMPT_CHARS + 1_000),
+        encoding="utf-8",
+    )
+    newest.write_text(
+        "NEWEST_JOURNAL_MARKER\n",
+        encoding="utf-8",
+    )
+
+    os.utime(oldest, (100, 100))
+    os.utime(newest, (200, 200))
+
+    monkeypatch.setattr(
+        "memsearch.maintenance._load_prompt_template",
+        lambda task, cfg: "Maintenance prompt",
+    )
+
+    ctx = TaskContext(
+        platform="claude-code",
+        task="project_review",
+        task_config=PluginMaintenanceTaskConfig(),
+        project_dir=project,
+        memsearch_dir=project / ".memsearch",
+        input_dir=memory,
+        output_file=project / ".memsearch" / "PROJECT.md",
+        input_digest="sha256:test",
+    )
+
+    prompt = _build_prompt(ctx, MemSearchConfig())
+
+    assert "NEWEST_JOURNAL_MARKER" in prompt
+    assert "OLDEST_JOURNAL_MARKER" not in prompt
+    assert "[older journal entries truncated]" in prompt
+    assert len(prompt) <= MAX_PROMPT_CHARS
+
+
+def test_newest_entries_within_oversized_journal_survive(
+    tmp_path: Path,
+) -> None:
+    memory = tmp_path / ".memsearch" / "memory"
+    memory.mkdir(parents=True)
+
+    journal = memory / "2026-07-28.md"
+    journal.write_text(
+        "### 09:00\nEARLIEST_ENTRY_MARKER\n" + "filler\n" * 1_000 + "### 23:00\nLATEST_ENTRY_MARKER\n",
+        encoding="utf-8",
+    )
+
+    os.utime(journal, (200, 200))
+
+    budget = 512
+    journals = _read_recent_journals(
+        memory,
+        budget=budget,
+    )
+
+    assert "LATEST_ENTRY_MARKER" in journals
+    assert "EARLIEST_ENTRY_MARKER" not in journals
+    assert "[older journal entries truncated]" in journals
+    assert len(journals) <= budget
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"action":"none","reason":"ok"}',
+        '```json\n{"action":"none","reason":"ok"}\n```',
+    ],
+)
+def test_parse_task_response_preserves_supported_json_formats(raw: str) -> None:
+    assert _parse_task_response(raw) == {
+        "action": "none",
+        "reason": "ok",
+    }
+
+
+def test_parse_task_response_accepts_reasoning_before_json() -> None:
+    raw = """\
+## Reasoning
+The recent journals do not add durable project state.
+
+## Result
+{"action":"none","reason":"No durable change."}
+"""
+
+    assert _parse_task_response(raw) == {
+        "action": "none",
+        "reason": "No durable change.",
+    }
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        '"',
+        "\n\nDone.",
+    ],
+)
+def test_parse_task_response_accepts_trailing_text_after_json(
+    suffix: str,
+) -> None:
+    raw = '{"action":"none","reason":"ok"}' + suffix
+
+    assert _parse_task_response(raw) == {
+        "action": "none",
+        "reason": "ok",
+    }
+
+
+def test_parse_task_response_skips_invalid_braces_before_result() -> None:
+    raw = """\
+Reasoning mentioned {not valid JSON}.
+
+{"action":"none","reason":"ok"}
+"""
+
+    assert _parse_task_response(raw) == {
+        "action": "none",
+        "reason": "ok",
+    }
+
+
+def test_parse_task_response_prefers_final_maintenance_object() -> None:
+    raw = """\
+The expected no-op shape is {"action":"none","reason":"example"}.
+
+## Result
+{"action":"replace","reason":"durable update","content":"# Project Memory"}
+"""
+
+    assert _parse_task_response(raw) == {
+        "action": "replace",
+        "reason": "durable update",
+        "content": "# Project Memory",
+    }
+
+
+def test_parse_task_response_preserves_outer_action_with_nested_object() -> None:
+    raw = (
+        json.dumps(
+            {
+                "action": "replace",
+                "reason": "durable update",
+                "content": "# Project Memory",
+                "meta": {"action": "none"},
+            }
+        )
+        + "\n\nDone."
+    )
+
+    parsed = _parse_task_response(raw)
+
+    assert parsed["action"] == "replace"
+
+
+def test_parse_task_response_rejects_truncated_outer_with_nested_action() -> None:
+    raw = '## Result\n{"action":"replace","meta":{"action":"none"},"content":"# Project Memory'
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not return valid JSON",
+    ):
+        _parse_task_response(raw)
+
+
+def test_parse_task_response_preserves_braces_inside_content() -> None:
+    raw = (
+        json.dumps(
+            {
+                "action": "replace",
+                "reason": "durable update",
+                "content": "# Project Memory\n\nUse {braces} safely.",
+            }
+        )
+        + "\n\nDone."
+    )
+
+    parsed = _parse_task_response(raw)
+
+    assert parsed["content"] == "# Project Memory\n\nUse {braces} safely."
+
+
+def test_parse_task_response_rejects_truncated_json() -> None:
+    raw = '## Result\n{"action":"replace","content":"# Project Memory'
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not return valid JSON",
+    ):
+        _parse_task_response(raw)
+
+
+def test_parse_task_response_rejects_invalid_action() -> None:
+    raw = '{"action":"append","reason":"unsupported"}'
+
+    with pytest.raises(
+        RuntimeError,
+        match="action must be 'none' or 'replace'",
+    ):
+        _parse_task_response(raw)
+
+
+def test_parse_task_response_rejects_nested_action_inside_non_dict() -> None:
+    raw = '[{"action":"none"}] trailing prose'
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not return valid JSON",
+    ):
+        _parse_task_response(raw)
+
+
+def test_parse_task_response_rejects_truncated_non_dict_with_nested_action() -> None:
+    raw = '[{"action":"none"}'
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not return valid JSON",
+    ):
+        _parse_task_response(raw)
 
 
 def test_openai_maintenance_uses_default_temperature(tmp_path: Path, monkeypatch) -> None:

@@ -20,8 +20,9 @@ from .contamination import (
     detect_contamination,
 )
 from .embeddings import EmbeddingProvider, get_provider
+from .index_report import IndexFailure, IndexReport, format_error
 from .io import read_utf8_text_replace
-from .scanner import ScannedFile, scan_paths
+from .scanner import ScannedFile, scan_paths, should_index_path
 from .store import MilvusStore
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,12 @@ class MemSearch:
     collection:
         Milvus collection name.  Use different names to isolate
         agents sharing the same Milvus server.
+    ignore_files:
+        Ignore filenames to discover within each directory index root, such
+        as ``[".gitignore"]``. Empty by default for backward compatibility.
+    exclude:
+        Additional gitignore-style patterns applied relative to each index
+        root after discovered ignore-file rules.
     """
 
     def __init__(
@@ -96,11 +103,15 @@ class MemSearch:
         description: str = "",
         max_chunk_size: int = 1500,
         overlap_lines: int = 2,
+        ignore_files: list[str] | None = None,
+        exclude: list[str] | None = None,
         reranker_model: str = "",
     ) -> None:
         self._paths = [str(p) for p in (paths or [])]
         self._max_chunk_size = max_chunk_size
         self._overlap_lines = overlap_lines
+        self._ignore_files = list(ignore_files or [])
+        self._exclude = list(exclude or [])
         self._embedder: EmbeddingProvider = get_provider(
             embedding_provider,
             model=embedding_model,
@@ -127,17 +138,26 @@ class MemSearch:
         Returns the number of chunks indexed.  Also removes chunks for
         files that no longer exist on disk (deleted-file cleanup).
         """
-        files = scan_paths(self._paths)
+        report = await self.index_with_report(force=force)
+        return report.indexed_chunks
+
+    async def index_with_report(self, *, force: bool = False) -> IndexReport:
+        """Scan paths and index all markdown files with structured status."""
+        files = scan_paths(
+            self._paths,
+            ignore_files=self._ignore_files,
+            exclude=self._exclude,
+        )
         total = 0
-        failed = 0
+        failed_files: list[IndexFailure] = []
         active_sources: set[str] = set()
         for f in files:
             active_sources.add(str(f.path))
             try:
                 n = await self._index_file(f, force=force)
                 total += n
-            except Exception:
-                failed += 1
+            except Exception as exc:
+                failed_files.append(IndexFailure(path=str(f.path), error=format_error(exc)))
                 logger.exception("Failed to index %s, skipping", f.path)
 
         # Clean up deleted files only inside directory roots from this run.
@@ -151,11 +171,21 @@ class MemSearch:
                     self._store.delete_by_source(source)
                     logger.info("Removed stale chunks for deleted file: %s", source)
 
-        if failed:
-            logger.warning("Indexed %d chunks from %d files (%d files failed)", total, len(files) - failed, failed)
+        if failed_files:
+            logger.warning(
+                "Indexed %d chunks from %d files (%d files failed)",
+                total,
+                len(files) - len(failed_files),
+                len(failed_files),
+            )
         else:
             logger.info("Indexed %d chunks from %d files", total, len(files))
-        return total
+        return IndexReport(
+            indexed_chunks=total,
+            total_files=len(files),
+            indexed_files=len(files) - len(failed_files),
+            failed_files=tuple(failed_files),
+        )
 
     async def index_file(self, path: str | Path) -> int:
         """Index a single file.  Returns number of chunks."""
@@ -399,6 +429,7 @@ class MemSearch:
         self,
         *,
         on_event: Callable[[str, str, Path], None] | None = None,
+        on_error: Callable[[str, BaseException, Path], None] | None = None,
         debounce_ms: int | None = None,
     ) -> FileWatcher:
         """Watch configured paths for markdown changes and auto-index.
@@ -413,6 +444,9 @@ class MemSearch:
             Optional callback invoked *after* each event is processed.
             Signature: ``(event_type, action_summary, file_path)``.
             ``event_type`` is ``"created"``, ``"modified"``, or ``"deleted"``.
+        on_error:
+            Optional callback invoked after an event fails. The watcher keeps
+            running after the callback.
 
         Returns
         -------
@@ -453,16 +487,28 @@ class MemSearch:
                 logger.info(summary)
                 if on_event is not None:
                     on_event(event_type, summary, file_path)
-            except Exception:
+            except Exception as exc:
                 # Watch is a long-running daemon callback — swallow any failure
                 # (network blips, provider 500s, malformed embeddings, disk
                 # errors, etc.) so a single bad file cannot crash the watcher.
                 logger.exception("Failed to process %s event for %s", event_type, file_path)
+                if on_error is not None:
+                    on_error(event_type, exc, file_path)
 
         fw_kwargs: dict[str, Any] = {}
         if debounce_ms is not None:
             fw_kwargs["debounce_ms"] = debounce_ms
-        watcher = FileWatcher(self._paths, _on_change, **fw_kwargs)
+        watcher = FileWatcher(
+            self._paths,
+            _on_change,
+            path_filter=lambda path: should_index_path(
+                path,
+                self._paths,
+                ignore_files=self._ignore_files,
+                exclude=self._exclude,
+            ),
+            **fw_kwargs,
+        )
         watcher.start()
         return watcher
 
