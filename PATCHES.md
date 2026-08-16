@@ -187,6 +187,25 @@ for T in upstream/main forge-main; do echo "-- $T"; <paste probe>; echo "exit $?
   ```
 - **last-verified:** `upstream/main` @ `d5809d7` on 2026-08-13 — **not covered**
 
+## compact-token-usage-log
+
+- **status:** fork-only
+- **upstream-pr:** none — candidate
+- **files:** `src/memsearch/compact.py`, `tests/test_compact.py`
+- **why:** `memsearch compact` logged no token counts at all, so the compact half of
+  the pipeline's spend could only be estimated from file sizes (bytes/4) while the
+  summarize half had exact per-call figures. That gap is what made the 2026-08 cost
+  projection guesswork on the model that mattered most. `_compact_openai` now appends
+  one JSON line per call — `timestamp`, `model`, `input_tokens`, `output_tokens`,
+  `event` — to `$MEMSEARCH_TOKEN_LOG`. Inert unless that variable is set, and wrapped
+  so a telemetry failure can never fail a compact. Consumed by `memsearch-spend.sh`
+  in `host-forge-scripts`.
+- **probe:** exits 0 iff upstream emits per-call token accounting from the compact path.
+  ```sh
+  git grep -qE 'prompt_tokens|completion_tokens|usage' "$T" -- src/memsearch/compact.py
+  ```
+- **last-verified:** `upstream/main` @ `d5809d7` on 2026-08-16 — **not covered**
+
 ## compact-thinking-block-tolerance
 
 - **status:** pending-PR
