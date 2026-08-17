@@ -162,3 +162,71 @@ def test_output_name_overrides_stem_but_keeps_source_date_heading() -> None:
 def test_output_name_strips_md_suffix() -> None:
     stem, _ = _compact_output_stem("/x/memory/2026-07-25.md", "developer-2026-07-25.md")
     assert stem == "developer-2026-07-25"
+
+
+# --- token usage logging (MEMSEARCH_TOKEN_LOG) -------------------------------
+
+
+def test_log_token_usage_is_noop_when_env_unset(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("MEMSEARCH_TOKEN_LOG", raising=False)
+    target = tmp_path / "tokens.log"
+    compact_module._log_token_usage("m", SimpleNamespace(prompt_tokens=1, completion_tokens=2), "compact")
+    assert not target.exists()
+
+
+def test_log_token_usage_appends_one_json_line(monkeypatch, tmp_path) -> None:
+    import json
+
+    target = tmp_path / "tokens.log"
+    monkeypatch.setenv("MEMSEARCH_TOKEN_LOG", str(target))
+    usage = SimpleNamespace(prompt_tokens=1234, completion_tokens=56)
+    compact_module._log_token_usage("mistral-small-latest", usage, "compact")
+    compact_module._log_token_usage("mistral-small-latest", usage, "summarize")
+
+    records = [json.loads(line) for line in target.read_text().splitlines() if line.strip()]
+    assert len(records) == 2
+    assert records[0]["input_tokens"] == 1234
+    assert records[0]["output_tokens"] == 56
+    assert records[0]["model"] == "mistral-small-latest"
+    assert [r["event"] for r in records] == ["compact", "summarize"]
+
+
+def test_log_token_usage_never_raises(monkeypatch, tmp_path) -> None:
+    """Telemetry must not be able to fail a compact."""
+    monkeypatch.setenv("MEMSEARCH_TOKEN_LOG", str(tmp_path / "no" / "such" / "dir" / "tokens.log"))
+    compact_module._log_token_usage("m", SimpleNamespace(prompt_tokens=1, completion_tokens=2), "compact")
+
+    monkeypatch.setenv("MEMSEARCH_TOKEN_LOG", str(tmp_path / "tokens.log"))
+    compact_module._log_token_usage("m", object(), "compact")  # no token attributes
+    compact_module._log_token_usage("m", None, "compact")
+
+
+@pytest.mark.asyncio
+async def test_compact_openai_logs_usage(monkeypatch, tmp_path) -> None:
+    import json
+
+    target = tmp_path / "tokens.log"
+    monkeypatch.setenv("MEMSEARCH_TOKEN_LOG", str(target))
+
+    resp = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=3),
+        choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))],
+    )
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        async def _create(self, **_kwargs):
+            return resp
+
+    import openai
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+    out = await compact_module._compact_openai("hi", "mistral-small-latest")
+
+    assert out == "summary"
+    record = json.loads(target.read_text().strip())
+    assert record["input_tokens"] == 10
+    assert record["output_tokens"] == 3
+    assert record["event"] == "compact"

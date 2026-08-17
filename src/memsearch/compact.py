@@ -9,7 +9,9 @@ API keys are read from environment variables:
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import resolve_env_ref
@@ -89,7 +91,9 @@ async def summarize_text(
     """Summarize preformatted text with a memsearch-managed LLM provider."""
     provider = "openai" if llm_provider == "openai-compatible" else llm_provider
     if provider == "openai":
-        return await _compact_openai(prompt, model or "gpt-5-mini", base_url=base_url, api_key=api_key)
+        return await _compact_openai(
+            prompt, model or "gpt-5-mini", base_url=base_url, api_key=api_key, usage_event="summarize"
+        )
     if provider == "anthropic":
         return await _compact_anthropic(prompt, model or "claude-sonnet-4-6")
     if provider == "gemini":
@@ -99,7 +103,37 @@ async def summarize_text(
     )
 
 
-async def _compact_openai(prompt: str, model: str, *, base_url: str | None = None, api_key: str | None = None) -> str:
+def _log_token_usage(model: str, usage: Any, event: str) -> None:
+    """Append one JSON line of token accounting to ``$MEMSEARCH_TOKEN_LOG``.
+
+    No-op unless that variable is set, so this stays inert for anyone who has
+    not opted in. Never raises: telemetry must not be able to fail a compact.
+    """
+    path = os.environ.get("MEMSEARCH_TOKEN_LOG")
+    if not path or usage is None:
+        return
+    try:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "input_tokens": getattr(usage, "prompt_tokens", None),
+            "output_tokens": getattr(usage, "completion_tokens", None),
+            "event": event,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception:  # noqa: BLE001 — telemetry is never worth losing work over
+        pass
+
+
+async def _compact_openai(
+    prompt: str,
+    model: str,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    usage_event: str = "compact",
+) -> str:
     import openai
 
     kwargs: dict = {}
@@ -114,6 +148,7 @@ async def _compact_openai(prompt: str, model: str, *, base_url: str | None = Non
         model=model,
         messages=[{"role": "user", "content": prompt}],
     )
+    _log_token_usage(model, getattr(resp, "usage", None), usage_event)
     return resp.choices[0].message.content or ""
 
 
