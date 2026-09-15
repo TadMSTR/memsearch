@@ -56,9 +56,9 @@ _inj_esc() {
   local s="${1:-}"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
-  s="${s//$'\t'/ }"
-  s="${s//$'\n'/ }"
-  s="${s//$'\r'/ }"
+  # Any raw control character makes the line invalid JSON — json.loads rejects
+  # them in strings — so collapse the whole class, not just \t \n \r.
+  s="${s//[[:cntrl:]]/ }"
   printf '%s' "$s"
 }
 
