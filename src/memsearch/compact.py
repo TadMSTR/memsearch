@@ -122,7 +122,7 @@ def _log_token_usage(model: str, usage: Any, event: str) -> None:
         }
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
-    except Exception:  # noqa: BLE001 — telemetry is never worth losing work over
+    except Exception:  # telemetry is never worth losing work over
         pass
 
 
