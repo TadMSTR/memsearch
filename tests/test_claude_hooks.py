@@ -813,3 +813,213 @@ def test_claude_stop_hook_is_spool_based_without_inline_summarizer() -> None:
     assert "CLAUDE_SAFE_MODE_ARG" not in source
     assert "parse-transcript.sh" in source
     assert "spool" in source
+
+
+# ---------------------------------------------------------------------------
+# UserPromptSubmit injection telemetry (vikunja#853)
+# ---------------------------------------------------------------------------
+# The hook injects memory into every qualifying prompt and, before this suite,
+# recorded nothing about it. These tests pin the telemetry contract: a record
+# on EVERY exit path (the misses are the control for "rarely fires" vs "fires
+# often, rarely used"), owner-only mode, a bounded file, and — most
+# importantly — that instrumenting the hook did not break the thing being
+# measured. A telemetry patch that silently killed the injection would produce
+# a very convincing "nobody uses it" result.
+
+_UPS_HOOK = "plugins/claude-code/hooks/user-prompt-submit.sh"
+
+_UPS_RESULTS = """[{"source":"/home/ted/.claude/memory/docs/alpha.md","content":"Alpha body.","heading":"H1","score":0.91},
+ {"source":"/home/ted/.claude/projects/p/.memsearch/memory/s.md","content":"Session body.","heading":"","score":0.52},
+ {"source":"/home/ted/.claude/memory/shared/w.md","content":"Working body.","heading":"H3","score":0.31}]"""
+
+
+def _write_fake_memsearch(path: Path, *, mode: str = "hits") -> None:
+    """Stub the memsearch CLI. `mode` selects the search behaviour under test."""
+    if mode == "hits":
+        body = f"cat <<'J'\n{_UPS_RESULTS}\nJ\n  exit 0"
+    elif mode == "empty":
+        body = 'echo "[]"\n  exit 0'
+    elif mode == "fail":
+        body = "exit 3"
+    else:  # pragma: no cover - guards against a typo in a future test
+        raise ValueError(mode)
+    _write_executable(
+        path,
+        f"""#!/usr/bin/env bash
+if [ "$1" = "search" ]; then
+  {body}
+fi
+exit 0
+""",
+    )
+
+
+def _run_prompt_hook(
+    tmp_path: Path,
+    prompt: str,
+    *,
+    mode: str = "hits",
+    log: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    home.mkdir(exist_ok=True)
+    fake_bin.mkdir(exist_ok=True)
+    _write_fake_memsearch(fake_bin / "memsearch", mode=mode)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+    }
+    if log is not None:
+        env["MEMSEARCH_INJECTION_LOG"] = str(log)
+    if extra_env:
+        env.update(extra_env)
+
+    payload = json.dumps(
+        {
+            "prompt": prompt,
+            "session_id": "sess-0001",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/home/ted/project",
+        }
+    )
+    return subprocess.run(
+        ["bash", _UPS_HOOK],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+
+def _log_records(log: Path) -> list[dict]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_user_prompt_submit_logs_an_injection(tmp_path: Path) -> None:
+    log = tmp_path / "injection-log.jsonl"
+    result = _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", log=log)
+
+    # The injection itself must still happen — this is the subject of the
+    # measurement, and a broken injection would fake a "nobody uses it" result.
+    payload = json.loads(result.stdout)
+    assert payload["systemMessage"].startswith("[memory] Relevant context auto-injected:")
+    assert "Alpha body." in payload["systemMessage"]
+
+    (record,) = _log_records(log)
+    assert record["outcome"] == "injected"
+    assert record["session_id"] == "sess-0001"
+    assert record["transcript_path"] == "/tmp/transcript.jsonl"
+    assert record["cwd"] == "/home/ted/project"
+    assert record["keywords"] == ["milvus", "tuning", "telemetry", "injection"]
+    assert record["prompt_len"] == len("milvus tuning telemetry injection")
+    # Top-2 injected, out of 3 returned — the cap is what is being measured.
+    assert record["results_total"] == 3
+    assert [r["source"] for r in record["results"]] == [
+        "/home/ted/.claude/memory/docs/alpha.md",
+        "/home/ted/.claude/projects/p/.memsearch/memory/s.md",
+    ]
+    assert [r["score"] for r in record["results"]] == [0.91, 0.52]
+    # injected_bytes must be the real payload size, not a placeholder.
+    assert record["injected_bytes"] == len(payload["systemMessage"].encode("utf-8"))
+    assert record["injected_bytes"] > 0
+
+
+def test_user_prompt_submit_logs_the_misses_not_just_the_injections(tmp_path: Path) -> None:
+    """The control. A success-only log cannot tell 'rarely fires' from
+    'fires often, rarely used', which is the whole question."""
+    log = tmp_path / "injection-log.jsonl"
+
+    _run_prompt_hook(tmp_path, "hi", log=log)
+    _run_prompt_hook(tmp_path, "is it the one that we do so as no", log=log)
+    _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", mode="empty", log=log)
+    _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", mode="fail", log=log)
+
+    records = _log_records(log)
+    assert [r["outcome"] for r in records] == [
+        "prompt_too_short",
+        "no_keywords",
+        "search_empty",
+        "search_failed",
+    ]
+    assert all(r["results"] == [] and r["injected_bytes"] == 0 for r in records)
+    assert records[0]["prompt_len"] == 2
+    # A failed search must be distinguishable from one that returned nothing:
+    # they are different answers to "why did nothing inject".
+    assert records[2]["search_rc"] == 0
+    assert records[3]["search_rc"] == 3
+
+
+def test_user_prompt_submit_log_is_owner_only(tmp_path: Path) -> None:
+    """The record carries prompt-derived keywords past only a stopword filter
+    and a 4-char minimum, so a pasted credential can survive into it."""
+    log = tmp_path / "injection-log.jsonl"
+    _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", log=log)
+    assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_user_prompt_submit_survives_an_unwritable_log(tmp_path: Path) -> None:
+    """A telemetry failure must never cost the user their prompt."""
+    log = tmp_path / "injection-log.jsonl"
+
+    # Establish the writer is actually live first. Without this the test passes
+    # against any hook that never writes a log at all, including the one this
+    # replaced — "no record appeared" would be vacuously true.
+    _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", log=log)
+    assert len(_log_records(log)) == 1
+
+    log.chmod(0o000)
+    try:
+        result = _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", log=log)
+        payload = json.loads(result.stdout)
+        assert payload["systemMessage"].startswith("[memory] Relevant context auto-injected:")
+        # Silent, too: a failing append must not leak to stderr on every prompt.
+        assert result.stderr == ""
+    finally:
+        log.chmod(0o600)
+    assert len(_log_records(log)) == 1  # unchanged — the failed write was dropped
+
+
+def test_user_prompt_submit_log_is_bounded(tmp_path: Path) -> None:
+    """Single-generation size rotation — on-disk use is capped at ~2x the cap
+    rather than growing unattended."""
+    log = tmp_path / "injection-log.jsonl"
+    log.write_text("x" * 4096, encoding="utf-8")
+    for _ in range(3):
+        _run_prompt_hook(
+            tmp_path,
+            "milvus tuning telemetry injection",
+            log=log,
+            extra_env={"MEMSEARCH_INJECTION_LOG_MAX_BYTES": "1024"},
+        )
+
+    assert (tmp_path / "injection-log.jsonl.1").exists()
+    # The pre-seeded 4096 bytes of padding are gone: rotation actually moved
+    # the file rather than appending forever.
+    assert "x" * 4096 not in log.read_text(encoding="utf-8")
+    assert len(_log_records(log)) == 1
+
+
+def test_user_prompt_submit_telemetry_can_be_disabled(tmp_path: Path) -> None:
+    log = tmp_path / "injection-log.jsonl"
+
+    # Same guard as above: prove logging is on by default before asserting the
+    # switch turns it off, or "no log" is true for the wrong reason.
+    _run_prompt_hook(tmp_path, "milvus tuning telemetry injection", log=log)
+    assert log.exists()
+    log.unlink()
+
+    result = _run_prompt_hook(
+        tmp_path,
+        "milvus tuning telemetry injection",
+        log=log,
+        extra_env={"MEMSEARCH_INJECTION_LOG_DISABLE": "1"},
+    )
+    assert "systemMessage" in json.loads(result.stdout)
+    assert not log.exists()
