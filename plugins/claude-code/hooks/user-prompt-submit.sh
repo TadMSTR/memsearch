@@ -67,7 +67,13 @@ _inj_esc() {
 # below; the strip here is defence in depth, not the primary guarantee.
 _inj_keywords_json() {
   local out="" k
-  for k in ${KEYWORDS:-}; do
+  local -a toks=()
+  # `read -a` splits without globbing. A bare `for k in ${KEYWORDS}` would
+  # pathname-expand any token containing a glob character. The extractor's
+  # regex cannot currently emit one, so this is defence in depth rather than a
+  # live fix — but it removes the dependence on that regex staying as it is.
+  read -r -a toks <<< "${KEYWORDS:-}" || true
+  for k in ${toks[@]+"${toks[@]}"}; do
     k="${k//[^a-zA-Z0-9_-]/}"
     if [ -n "$k" ]; then
       if [ -n "$out" ]; then out="${out},"; fi
