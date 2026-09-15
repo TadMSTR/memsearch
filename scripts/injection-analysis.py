@@ -46,6 +46,15 @@ from pathlib import Path
 
 DEFAULT_LOG = Path.home() / ".memsearch" / "injection-log.jsonl"
 
+# Transcripts live under the Claude Code projects root. `transcript_path` reaches
+# this script from the hook's stdin, via the log, unvalidated — the hook only
+# ever JSON-escapes it, never treats it as a path. Containing the open() here
+# removes a silent dependency on "the log's trust level never gets weaker than
+# the hook's". It is not closing a live hole today (writing an attacker-chosen
+# value already requires code execution as the log's owner); it stops one from
+# opening later if another writer or a narrower-trust consumer appears.
+TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
+
 # Deliberate retrievals — the "pull" path the injection was meant to replace.
 MEMORY_TOOLS = {
     "mcp__scoped-mcp__memsearch-mcp_search_memory",
@@ -102,6 +111,18 @@ def agent_of(record: dict) -> str:
     if marker in cwd:
         return cwd.split(marker, 1)[1].split("/", 1)[0] or "unknown"
     return Path(cwd).name or "unknown"
+
+
+def transcript_allowed(path: str, root: Path | None) -> bool:
+    """True if `path` is inside `root` (or containment is disabled)."""
+    if root is None:
+        return True
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return False
+    # `resolve()` first, so a symlink or ../ traversal out of the root is caught.
+    return resolved == root or root in resolved.parents
 
 
 def iter_transcript(path: str):
@@ -172,7 +193,7 @@ def needles(result: dict) -> list[str]:
     return out
 
 
-def correlate(records: list[dict]) -> dict:
+def correlate(records: list[dict], transcript_root: Path | None = TRANSCRIPT_ROOT) -> dict:
     """For each injected record, inspect its session's transcript afterwards."""
     by_session: dict[str, list[dict]] = defaultdict(list)
     for rec in records:
@@ -182,6 +203,12 @@ def correlate(records: list[dict]) -> dict:
     stats = {
         "analysed": 0,
         "transcript_missing": 0,
+        # Counted separately, never folded into transcript_missing: a rejected
+        # path is a measurement this script declined to take, not one the data
+        # never had. Collapsing them would let containment quietly shrink the
+        # denominator and flatter every rate computed from it.
+        "transcript_rejected": 0,
+        "rejected_paths": [],
         "followed_by_memory_tool": 0,
         "referenced": 0,
         "referenced_before_any_memory_tool": 0,
@@ -191,6 +218,11 @@ def correlate(records: list[dict]) -> dict:
     for session_id, injections in by_session.items():
         injections.sort(key=lambda r: r.get("ts") or "")
         transcript = injections[0].get("transcript_path") or ""
+        if transcript and not transcript_allowed(transcript, transcript_root):
+            stats["transcript_rejected"] += len(injections)
+            if transcript not in stats["rejected_paths"]:
+                stats["rejected_paths"].append(transcript)
+            continue
         entries = [e for e in iter_transcript(transcript) if parse_ts(e.get("timestamp"))]
         if not entries:
             stats["transcript_missing"] += len(injections)
@@ -364,6 +396,13 @@ def render(summary: dict, corr: dict) -> str:
     an = corr["analysed"]
     a(f"  injections analysed              {an:>7}")
     a(f"  transcript unavailable           {corr['transcript_missing']:>7}")
+    if corr.get("transcript_rejected"):
+        a(f"  transcript path REJECTED         {corr['transcript_rejected']:>7}   (outside {TRANSCRIPT_ROOT})")
+        for bad in corr["rejected_paths"][:5]:
+            a(f"      {bad}")
+        a("    These were not analysed. Re-run with --allow-any-transcript-path")
+        a("    if the location is legitimate — do not read the rates above as")
+        a("    if these injections simply had no transcript.")
     a(f"  followed by a memory-tool call   {corr['followed_by_memory_tool']:>7}  {pct(corr['followed_by_memory_tool'], an)}   (weak NEGATIVE)")
     a(f"  source referenced later          {corr['referenced']:>7}  {pct(corr['referenced'], an)}   (proxy POSITIVE)")
     a(f"    ...before any memory-tool call {corr['referenced_before_any_memory_tool']:>7}  {pct(corr['referenced_before_any_memory_tool'], an)}   (strongest available)")
@@ -388,6 +427,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--log", type=Path, default=DEFAULT_LOG, help=f"injection log (default: {DEFAULT_LOG})")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of the text report")
+    ap.add_argument(
+        "--allow-any-transcript-path",
+        action="store_true",
+        help=f"do not require transcript_path to live under {TRANSCRIPT_ROOT}",
+    )
     args = ap.parse_args()
 
     if not args.log.exists() and not Path(f"{args.log}.1").exists():
@@ -406,7 +450,7 @@ def main() -> int:
         return 1
 
     summary = summarise(records, malformed)
-    corr = correlate(records)
+    corr = correlate(records, None if args.allow_any_transcript_path else TRANSCRIPT_ROOT)
 
     if args.json:
         print(json.dumps({"summary": summary, "correlation": corr}, indent=2, ensure_ascii=False))
