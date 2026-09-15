@@ -31,6 +31,31 @@ a paraphrase of an injected snippet is invisible here, and the positive signal
 is therefore a floor, not a ceiling.
 
 Raw counts are printed alongside every rate so the numbers can be argued with.
+
+WHAT `score` IS, AND IS NOT
+---------------------------
+It is NOT a similarity. `store.py` runs a Milvus hybrid search over a dense and a
+BM25 retriever, fused with `RRFRanker(k=60)`, and normalises by the theoretical
+maximum `len(reqs)/(k+1)` = 2/61. The logged `score` is therefore a function of
+RANK POSITION in the two result lists, not of how close the match is:
+
+    0.5000  rank 1 in exactly one retriever      (1/61) / (2/61)
+    0.4919  rank 2 in exactly one retriever      (1/62) / (2/61)
+    0.9841  rank 1 in one + rank 3 in the other
+    1.0000  rank 1 in both
+
+The hook additionally passes `--reranker-model ""`, so the cross-encoder in
+`reranker.py` — the only component that would produce a real relevance score —
+never runs.
+
+Consequence: a minimum-score floor CANNOT work as a relevance filter. The best
+available match always occupies rank 1 and therefore always scores ~0.5,
+however weak it is in absolute terms. A floor at 0.5 keeps everything; a floor
+above it keeps only results both retrievers agree on, which measures retriever
+agreement, not quality. The build plan named a score floor as the cheap fix for
+a "marginal" outcome; that option rests on a premise about this field that is
+not true. Report the distribution as a rank-agreement histogram, and do not read
+it as relevance.
 """
 
 from __future__ import annotations
@@ -296,6 +321,13 @@ def summarise(records: list[dict], malformed: int) -> dict:
         for rec in injected
         for r in rec.get("results") or []
     )
+    # How often the top-2 cap is spent on two chunks of the SAME file. Observed
+    # live on the very first deployment probe, so it is not hypothetical: if it
+    # is common, the cap delivers one document's worth of context, not two.
+    multi = [rec for rec in injected if len(rec.get("results") or []) >= 2]
+    same_source = sum(
+        1 for rec in multi if len({(r.get("source") or "") for r in rec["results"]}) == 1
+    )
     per_agent_outcomes: dict[str, Counter] = defaultdict(Counter)
     for rec in records:
         per_agent_outcomes[agent_of(rec)][rec.get("outcome") or "unknown"] += 1
@@ -318,6 +350,8 @@ def summarise(records: list[dict], malformed: int) -> dict:
             Counter(r.get("search_rc") for r in records if r.get("outcome") == "search_failed")
         ),
         "tiers": dict(tiers),
+        "two_result_injections": len(multi),
+        "both_results_same_source": same_source,
         "scores": {
             "n": len(scores),
             "min": round(min(scores), 4) if scores else None,
@@ -377,8 +411,16 @@ def render(summary: dict, corr: dict) -> str:
     s = summary["scores"]
     if s["n"]:
         a(f"  n={s['n']}  min={s['min']}  median={s['median']}  mean={s['mean']}  max={s['max']}")
-        a("  If these cluster low, a minimum-score floor is a smaller change")
-        a("  than retiring the hook. Reported only — not acted on here.")
+        a("")
+        a("  NOT a similarity. This is a normalised RRF rank-fusion score")
+        a("  (RRFRanker k=60 over dense+BM25, /(2/61)), so it encodes rank")
+        a("  position, not closeness:")
+        a("     ~0.50 = rank 1 in one retriever   ~0.49 = rank 2 in one")
+        a("     ~0.98 = rank 1 + rank 3           ~1.00 = rank 1 in both")
+        a("  The best available match always sits at rank 1 and so always")
+        a("  scores ~0.5 however weak it is. A minimum-score floor therefore")
+        a("  filters on retriever agreement, not quality — it is NOT the cheap")
+        a("  fix the build plan assumed. See the module docstring.")
     else:
         a("  no scored results")
     a("")
@@ -389,6 +431,16 @@ def render(summary: dict, corr: dict) -> str:
     for tier, count in sorted(summary["tiers"].items(), key=lambda kv: -kv[1]):
         a(f"  {tier or '(none)':<20} {count:>7}  {pct(count, tier_total)}")
     a("  Overwhelmingly 'session' would mean the hook mostly recycles recent chatter.")
+    a("")
+    a("Result diversity")
+    a("-" * 64)
+    a(f"  injections returning 2 results       {summary['two_result_injections']:>7}")
+    a(
+        f"  ...both from the SAME source file   {summary['both_results_same_source']:>7}"
+        f"  {pct(summary['both_results_same_source'], summary['two_result_injections'])}"
+    )
+    a("  When both slots hold chunks of one document, the top-2 cap buys one")
+    a("  document's worth of context rather than two.")
     a("")
 
     a("Was it used? (proxies — see module docstring)")
